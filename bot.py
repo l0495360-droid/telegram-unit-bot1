@@ -1,6 +1,5 @@
+import os
 import logging
-import signal
-import sys
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 
@@ -11,18 +10,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Получаем токен из переменных окружения
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 
-# Обработчик остановки бота
-def signal_handler(sig, frame):
-    logging.info('Бот остановлен')
-    sys.exit(0)
+# Проверка наличия токена
+if not TOKEN:
+    logger.error("❌ TELEGRAM_BOT_TOKEN не найден!")
+    logger.error("Добавьте TELEGRAM_BOT_TOKEN в настройки Bothost")
+    exit(1)
 
-signal.signal(signal.SIGINT, signal_handler)
+logger.info("✅ Токен успешно получен")
 
 # Состояния для ConversationHandler
 SELECT_CATEGORY, SELECT_UNIT_FROM, SELECT_UNIT_TO, ENTER_VALUE = range(4)
-
 # Словарь с физическими величинами и единицами измерения
 PHYSICAL_QUANTITIES = {
     "Длина": {
@@ -360,3 +360,4 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
+
