@@ -2,22 +2,35 @@ import os
 import logging
 import re
 import math
-from datetime import datetime
-from typing import Dict, List, Tuple, Optional
+import json
+import asyncio
+from datetime import datetime, timedelta
+from typing import Dict, List, Tuple, Optional, Any
 import sqlite3
 from contextlib import contextmanager
-from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
+from enum import Enum
+import aiohttp
+from dataclasses import dataclass
+
+from telegram import (
+    Update, 
+    ReplyKeyboardMarkup, 
+    InlineKeyboardMarkup, 
+    InlineKeyboardButton,
+    InputFile
+)
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters, ContextTypes, 
-    ConversationHandler, CallbackQueryHandler
+    ConversationHandler, CallbackQueryHandler, JobQueue
 )
+from telegram.constants import ParseMode
 
-# Настройка логирования
+# Настройка расширенного логирования
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('converter_bot.log', encoding='utf-8'),
+        logging.FileHandler('converter_bot_advanced.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -25,7 +38,6 @@ logger = logging.getLogger(__name__)
 
 # Получаем токен из переменных окружения
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-
 if not TOKEN:
     logger.error("❌ TELEGRAM_BOT_TOKEN не найден!")
     exit(1)
@@ -33,217 +45,396 @@ if not TOKEN:
 logger.info("✅ Токен успешно получен")
 
 # Состояния для ConversationHandler
-SELECT_CATEGORY, SELECT_UNIT_FROM, SELECT_UNIT_TO, ENTER_VALUE, SAVE_FAVORITE = range(5)
+class BotState(Enum):
+    SELECT_CATEGORY = 1
+    SELECT_UNIT_FROM = 2
+    SELECT_UNIT_TO = 3
+    ENTER_VALUE = 4
+    SAVE_FAVORITE = 5
+    ENTER_FAVORITE_NAME = 6
+    BATCH_CONVERSION = 7
 
-# Инициализация базы данных
-def init_database():
-    """Инициализация базы данных SQLite"""
-    with get_db_connection() as conn:
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS user_favorites (
-                user_id INTEGER,
-                favorite_name TEXT,
-                from_unit TEXT,
-                to_unit TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (user_id, favorite_name)
-            )
-        ''')
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS conversion_history (
-                user_id INTEGER,
-                from_value REAL,
-                from_unit TEXT,
-                to_value REAL,
-                to_unit TEXT,
-                converted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS user_stats (
-                user_id INTEGER PRIMARY KEY,
-                conversions_count INTEGER DEFAULT 0,
-                last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
+# Конфигурация бота
+class BotConfig:
+    MAX_FAVORITES = 50
+    MAX_HISTORY = 100
+    CACHE_DURATION = 3600  # 1 час
+    SESSION_TIMEOUT = 300  # 5 минут
+    RATE_LIMIT = 10  # сообщений в минуту
 
-@contextmanager
-def get_db_connection():
-    """Контекстный менеджер для подключения к БД"""
-    conn = sqlite3.connect('converter_bot.db', check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+@dataclass
+class ConversionResult:
+    value: float
+    unit_from: str
+    unit_to: str
+    result: float
+    category: str
+    timestamp: datetime
 
-# Расширенный словарь с физическими величинами
-PHYSICAL_QUANTITIES = {
-    "Длина": {
-        "метр (м)": 1.0, "километр (км)": 1000.0, "сантиметр (см)": 0.01, "миллиметр (мм)": 0.001,
-        "дюйм (in)": 0.0254, "фут (ft)": 0.3048, "ярд (yd)": 0.9144, "миля (mi)": 1609.34,
-        "морская миля": 1852.0
-    },
-    "Древнерусские меры длины": {
-        "вершок": 0.04445, "пядь": 0.1778, "локоть": 0.4572, "аршин": 0.7112,
-        "сажень": 2.1336, "верста": 1066.8, "поприще": 1500.0
-    },
-    "Масса": {
-        "килограмм (кг)": 1.0, "грамм (г)": 0.001, "миллиграмм (мг)": 1e-6,
-        "тонна (т)": 1000.0, "центнер (ц)": 100.0, "фунт (lb)": 0.453592,
-        "унция (oz)": 0.0283495, "пуд": 16.3805, "золотник": 0.004266
-    },
-    "Время": {
-        "секунда (с)": 1.0, "минута (мин)": 60.0, "час (ч)": 3600.0, "день": 86400.0,
-        "неделя": 604800.0, "месяц": 2592000.0, "год": 31536000.0
-    },
-    "Температура": {
-        "Цельсий (°C)": "celsius", "Фаренгейт (°F)": "fahrenheit", "Кельвин (K)": "kelvin"
-    },
-    "Площадь": {
-        "кв. метр (м²)": 1.0, "кв. километр (км²)": 1e6, "кв. сантиметр (см²)": 1e-4,
-        "гектар (га)": 10000.0, "акр": 4046.86, "сотка (ар)": 100.0,
-        "кв. дюйм": 0.00064516, "кв. фут": 0.092903
-    },
-    "Объем": {
-        "куб. метр (м³)": 1.0, "литр (л)": 0.001, "миллилитр (мл)": 1e-6,
-        "куб. сантиметр (см³)": 1e-6, "галлон (US)": 0.00378541, "баррель нефтяной": 0.158987,
-        "куб. дюйм": 1.6387e-5, "куб. фут": 0.0283168
-    },
-    "Скорость": {
-        "метр/сек (м/с)": 1.0, "километр/час (км/ч)": 0.277778, "миля/час (mph)": 0.44704,
-        "узел (kn)": 0.514444, "фут/сек (ft/s)": 0.3048
-    },
-    "Давление": {
-        "паскаль (Па)": 1.0, "килопаскаль (кПа)": 1000.0, "бар": 1e5,
-        "атмосфера (атм)": 101325.0, "мм рт. ст. (торр)": 133.322, "psi": 6894.76
-    },
-    "Информация": {
-        "бит (bit)": 1.0, "байт (byte)": 8.0, "килобит (Kbit)": 1024.0,
-        "килобайт (KB)": 8192.0, "мегабит (Mbit)": 1048576.0, "мегабайт (MB)": 8388608.0,
-        "гигабит (Gbit)": 1073741824.0, "гигабайт (GB)": 8589934592.0
-    },
-    "Скорость передачи данных": {
-        "бит/сек (bps)": 1.0, "килобит/сек (Kbps)": 1024.0, "мегабит/сек (Mbps)": 1048576.0,
-        "гигабит/сек (Gbps)": 1073741824.0, "байт/сек (Bps)": 8.0,
-        "килобайт/сек (KBps)": 8192.0, "мегабайт/сек (MBps)": 8388608.0
-    },
-    "Энергия": {
-        "джоуль (Дж)": 1.0, "килоджоуль (кДж)": 1000.0, "калория (кал)": 4.184,
-        "килокалория (ккал)": 4184.0, "ватт-час (Вт·ч)": 3600.0,
-        "киловатт-час (кВт·ч)": 3.6e6, "электронвольт (эВ)": 1.602e-19
-    },
-    "Мощность": {
-        "ватт (Вт)": 1.0, "киловатт (кВт)": 1000.0, "лошадиная сила (л.с.)": 735.499,
-        "лошадиная сила (hp)": 745.7
-    }
-}
-
-# Группы совместимых категорий
-COMPATIBLE_CATEGORIES = {
-    "Длина": ["Длина", "Древнерусские меры длины"],
-    "Древнерусские меры длины": ["Длина", "Древнерусские меры длины"],
-    "Масса": ["Масса"], "Время": ["Время"], "Температура": ["Температура"],
-    "Площадь": ["Площадь"], "Объем": ["Объем"], "Скорость": ["Скорость"],
-    "Давление": ["Давление"], "Информация": ["Информация"],
-    "Скорость передачи данных": ["Скорость передачи данных"],
-    "Энергия": ["Энергия"], "Мощность": ["Мощность"]
-}
-
-# Популярные конвертации для быстрого доступа
-POPULAR_CONVERSIONS = {
-    "📏 Дюймы в см": ("10 дюйм (in)", "сантиметр (см)"),
-    "📏 Футы в метры": ("6 фут (ft)", "метр (м)"),
-    "⚖️ Фунты в кг": ("1 фунт (lb)", "килограмм (кг)"),
-    "🌡️ °F в °C": ("32 Фаренгейт (°F)", "Цельсий (°C)"),
-    "💻 Мбит в МБ": ("100 мегабит/сек (Mbps)", "мегабайт/сек (MBps)"),
-    "📊 Байты в биты": ("1 байт (byte)", "бит (bit)"),
-    "🛣️ Версты в км": ("1 верста", "километр (км)"),
-    "📐 Сажени в метры": ("1 сажень", "метр (м)")
-}
-
-class UnitConverter:
-    """Класс для конвертации единиц измерения"""
+class EnhancedUnitConverter:
+    """Усовершенствованный конвертер с поддержкой формул и сложных преобразований"""
     
-    @staticmethod
-    def convert_temperature(value: float, from_unit: str, to_unit: str) -> float:
-        """Конвертация температуры"""
+    # Расширенная база единиц измерения
+    PHYSICAL_QUANTITIES = {
+        "Длина": {
+            "метр (м)": {"factor": 1.0, "type": "linear"},
+            "километр (км)": {"factor": 1000.0, "type": "linear"},
+            "сантиметр (см)": {"factor": 0.01, "type": "linear"},
+            "миллиметр (мм)": {"factor": 0.001, "type": "linear"},
+            "микрометр (мкм)": {"factor": 1e-6, "type": "linear"},
+            "нанометр (нм)": {"factor": 1e-9, "type": "linear"},
+            "дюйм (in)": {"factor": 0.0254, "type": "linear"},
+            "фут (ft)": {"factor": 0.3048, "type": "linear"},
+            "ярд (yd)": {"factor": 0.9144, "type": "linear"},
+            "миля (mi)": {"factor": 1609.34, "type": "linear"},
+            "морская миля": {"factor": 1852.0, "type": "linear"},
+            "астрономическая единица (а.е.)": {"factor": 1.496e11, "type": "linear"},
+            "световой год (ly)": {"factor": 9.461e15, "type": "linear"},
+            "парсек (pc)": {"factor": 3.086e16, "type": "linear"}
+        },
+        "Древнерусские меры длины": {
+            "вершок": {"factor": 0.04445, "type": "linear"},
+            "пядь": {"factor": 0.1778, "type": "linear"},
+            "локоть": {"factor": 0.4572, "type": "linear"},
+            "аршин": {"factor": 0.7112, "type": "linear"},
+            "сажень": {"factor": 2.1336, "type": "linear"},
+            "верста": {"factor": 1066.8, "type": "linear"},
+            "поприще": {"factor": 1500.0, "type": "linear"}
+        },
+        "Масса": {
+            "килограмм (кг)": {"factor": 1.0, "type": "linear"},
+            "грамм (г)": {"factor": 0.001, "type": "linear"},
+            "миллиграмм (мг)": {"factor": 1e-6, "type": "linear"},
+            "тонна (т)": {"factor": 1000.0, "type": "linear"},
+            "центнер (ц)": {"factor": 100.0, "type": "linear"},
+            "карат": {"factor": 0.0002, "type": "linear"},
+            "фунт (lb)": {"factor": 0.453592, "type": "linear"},
+            "унция (oz)": {"factor": 0.0283495, "type": "linear"},
+            "пуд": {"factor": 16.3805, "type": "linear"},
+            "золотник": {"factor": 0.004266, "type": "linear"},
+            "берковец": {"factor": 163.805, "type": "linear"}
+        },
+        "Время": {
+            "секунда (с)": {"factor": 1.0, "type": "linear"},
+            "миллисекунда (мс)": {"factor": 0.001, "type": "linear"},
+            "микросекунда (мкс)": {"factor": 1e-6, "type": "linear"},
+            "минута (мин)": {"factor": 60.0, "type": "linear"},
+            "час (ч)": {"factor": 3600.0, "type": "linear"},
+            "день": {"factor": 86400.0, "type": "linear"},
+            "неделя": {"factor": 604800.0, "type": "linear"},
+            "месяц (30 дней)": {"factor": 2592000.0, "type": "linear"},
+            "год (365 дней)": {"factor": 31536000.0, "type": "linear"},
+            "век": {"factor": 3.15576e9, "type": "linear"}
+        },
+        "Температура": {
+            "Цельсий (°C)": {"type": "temperature"},
+            "Фаренгейт (°F)": {"type": "temperature"},
+            "Кельвин (K)": {"type": "temperature"},
+            "Ранкин (°R)": {"type": "temperature"},
+            "Реомюр (°Ré)": {"type": "temperature"}
+        },
+        "Площадь": {
+            "кв. метр (м²)": {"factor": 1.0, "type": "area"},
+            "кв. километр (км²)": {"factor": 1e6, "type": "area"},
+            "кв. сантиметр (см²)": {"factor": 1e-4, "type": "area"},
+            "кв. миллиметр (мм²)": {"factor": 1e-6, "type": "area"},
+            "гектар (га)": {"factor": 10000.0, "type": "area"},
+            "акр": {"factor": 4046.86, "type": "area"},
+            "сотка (ар)": {"factor": 100.0, "type": "area"},
+            "кв. дюйм": {"factor": 0.00064516, "type": "area"},
+            "кв. фут": {"factor": 0.092903, "type": "area"},
+            "кв. миля": {"factor": 2.59e6, "type": "area"},
+            "десятина": {"factor": 10925.0, "type": "area"}
+        },
+        "Объем": {
+            "куб. метр (м³)": {"factor": 1.0, "type": "volume"},
+            "литр (л)": {"factor": 0.001, "type": "volume"},
+            "миллилитр (мл)": {"factor": 1e-6, "type": "volume"},
+            "куб. сантиметр (см³)": {"factor": 1e-6, "type": "volume"},
+            "куб. дециметр (дм³)": {"factor": 0.001, "type": "volume"},
+            "галлон US": {"factor": 0.00378541, "type": "volume"},
+            "галлон UK": {"factor": 0.00454609, "type": "volume"},
+            "баррель нефтяной": {"factor": 0.158987, "type": "volume"},
+            "куб. дюйм": {"factor": 1.6387e-5, "type": "volume"},
+            "куб. фут": {"factor": 0.0283168, "type": "volume"},
+            "ведро": {"factor": 0.012, "type": "volume"},
+            "бочка": {"factor": 0.491976, "type": "volume"},
+            "штоф": {"factor": 0.00123, "type": "volume"}
+        },
+        "Скорость": {
+            "метр/сек (м/с)": {"factor": 1.0, "type": "linear"},
+            "километр/час (км/ч)": {"factor": 0.277778, "type": "linear"},
+            "миля/час (mph)": {"factor": 0.44704, "type": "linear"},
+            "узел (kn)": {"factor": 0.514444, "type": "linear"},
+            "фут/сек (ft/s)": {"factor": 0.3048, "type": "linear"},
+            "скорость света (c)": {"factor": 299792458, "type": "linear"},
+            "маховое число (M)": {"factor": 340.3, "type": "linear"}
+        },
+        "Ускорение": {
+            "метр/сек² (м/с²)": {"factor": 1.0, "type": "linear"},
+            "фут/сек² (ft/s²)": {"factor": 0.3048, "type": "linear"},
+            "g (ускорение свободного падения)": {"factor": 9.80665, "type": "linear"},
+            "Гал (Gal)": {"factor": 0.01, "type": "linear"}
+        },
+        "Давление": {
+            "паскаль (Па)": {"factor": 1.0, "type": "linear"},
+            "килопаскаль (кПа)": {"factor": 1000.0, "type": "linear"},
+            "мегапаскаль (МПа)": {"factor": 1e6, "type": "linear"},
+            "бар": {"factor": 1e5, "type": "linear"},
+            "миллибар (мбар)": {"factor": 100.0, "type": "linear"},
+            "атмосфера (атм)": {"factor": 101325.0, "type": "linear"},
+            "мм рт. ст. (торр)": {"factor": 133.322, "type": "linear"},
+            "psi": {"factor": 6894.76, "type": "linear"},
+            "техническая атмосфера (ат)": {"factor": 98066.5, "type": "linear"}
+        },
+        "Энергия": {
+            "джоуль (Дж)": {"factor": 1.0, "type": "linear"},
+            "килоджоуль (кДж)": {"factor": 1000.0, "type": "linear"},
+            "мегаджоуль (МДж)": {"factor": 1e6, "type": "linear"},
+            "калория (кал)": {"factor": 4.184, "type": "linear"},
+            "килокалория (ккал)": {"factor": 4184.0, "type": "linear"},
+            "ватт-час (Вт·ч)": {"factor": 3600.0, "type": "linear"},
+            "киловатт-час (кВт·ч)": {"factor": 3.6e6, "type": "linear"},
+            "электронвольт (эВ)": {"factor": 1.602e-19, "type": "linear"},
+            "мегаэлектронвольт (МэВ)": {"factor": 1.602e-13, "type": "linear"},
+            "БТЕ (BTU)": {"factor": 1055.06, "type": "linear"},
+            "эрг": {"factor": 1e-7, "type": "linear"}
+        },
+        "Мощность": {
+            "ватт (Вт)": {"factor": 1.0, "type": "linear"},
+            "киловатт (кВт)": {"factor": 1000.0, "type": "linear"},
+            "мегаватт (МВт)": {"factor": 1e6, "type": "linear"},
+            "лошадиная сила (л.с.)": {"factor": 735.499, "type": "linear"},
+            "лошадиная сила (hp)": {"factor": 745.7, "type": "linear"},
+            "калория/сек": {"factor": 4.184, "type": "linear"}
+        },
+        "Информация": {
+            "бит (bit)": {"factor": 1.0, "type": "digital"},
+            "байт (byte)": {"factor": 8.0, "type": "digital"},
+            "килобит (Kbit)": {"factor": 1024.0, "type": "digital"},
+            "килобайт (KB)": {"factor": 8192.0, "type": "digital"},
+            "мегабит (Mbit)": {"factor": 1048576.0, "type": "digital"},
+            "мегабайт (MB)": {"factor": 8388608.0, "type": "digital"},
+            "гигабит (Gbit)": {"factor": 1073741824.0, "type": "digital"},
+            "гигабайт (GB)": {"factor": 8589934592.0, "type": "digital"},
+            "терабит (Tbit)": {"factor": 1099511627776.0, "type": "digital"},
+            "терабайт (TB)": {"factor": 8796093022208.0, "type": "digital"},
+            "петабит (Pbit)": {"factor": 1125899906842624.0, "type": "digital"},
+            "петабайт (PB)": {"factor": 9007199254740992.0, "type": "digital"}
+        },
+        "Скорость передачи данных": {
+            "бит/сек (bps)": {"factor": 1.0, "type": "digital"},
+            "килобит/сек (Kbps)": {"factor": 1024.0, "type": "digital"},
+            "мегабит/сек (Mbps)": {"factor": 1048576.0, "type": "digital"},
+            "гигабит/сек (Gbps)": {"factor": 1073741824.0, "type": "digital"},
+            "терабит/сек (Tbps)": {"factor": 1099511627776.0, "type": "digital"},
+            "байт/сек (Bps)": {"factor": 8.0, "type": "digital"},
+            "килобайт/сек (KBps)": {"factor": 8192.0, "type": "digital"},
+            "мегабайт/сек (MBps)": {"factor": 8388608.0, "type": "digital"},
+            "гигабайт/сек (GBps)": {"factor": 8589934592.0, "type": "digital"},
+            "терабайт/сек (TBps)": {"factor": 8796093022208.0, "type": "digital"}
+        },
+        "Углы": {
+            "радиан (rad)": {"factor": 1.0, "type": "angle"},
+            "градус (°)": {"factor": 0.0174533, "type": "angle"},
+            "минута угловая (′)": {"factor": 0.000290888, "type": "angle"},
+            "секунда угловая (″)": {"factor": 4.84814e-6, "type": "angle"},
+            "оборот (rev)": {"factor": 6.28319, "type": "angle"},
+            "град (gon)": {"factor": 0.015708, "type": "angle"}
+        },
+        "Частота": {
+            "герц (Гц)": {"factor": 1.0, "type": "linear"},
+            "килогерц (кГц)": {"factor": 1000.0, "type": "linear"},
+            "мегагерц (МГц)": {"factor": 1e6, "type": "linear"},
+            "гигагерц (ГГц)": {"factor": 1e9, "type": "linear"},
+            "оборот/мин (rpm)": {"factor": 0.0166667, "type": "linear"},
+            "радиан/сек (rad/s)": {"factor": 0.159155, "type": "linear"}
+        },
+        "Сила": {
+            "ньютон (Н)": {"factor": 1.0, "type": "linear"},
+            "килоньютон (кН)": {"factor": 1000.0, "type": "linear"},
+            "дина": {"factor": 1e-5, "type": "linear"},
+            "килограмм-сила (кгс)": {"factor": 9.80665, "type": "linear"},
+            "фунт-сила (lbf)": {"factor": 4.44822, "type": "linear"}
+        },
+        "Плотность": {
+            "кг/м³": {"factor": 1.0, "type": "linear"},
+            "г/см³": {"factor": 1000.0, "type": "linear"},
+            "г/л": {"factor": 1.0, "type": "linear"},
+            "фунт/куб.фут": {"factor": 16.0185, "type": "linear"},
+            "фунт/куб.дюйм": {"factor": 27679.9, "type": "linear"}
+        },
+        "Вязкость": {
+            "паскаль-секунда (Па·с)": {"factor": 1.0, "type": "linear"},
+            "сантипуаз (сП)": {"factor": 0.001, "type": "linear"},
+            "пуаз (П)": {"factor": 0.1, "type": "linear"}
+        }
+    }
+
+    # Формулы для сложных преобразований
+    FORMULAS = {
+        "температура": {
+            "Цельсий (°C)": {
+                "Фаренгейт (°F)": lambda x: (x * 9/5) + 32,
+                "Кельвин (K)": lambda x: x + 273.15,
+                "Ранкин (°R)": lambda x: (x + 273.15) * 9/5,
+                "Реомюр (°Ré)": lambda x: x * 4/5
+            },
+            "Фаренгейт (°F)": {
+                "Цельсий (°C)": lambda x: (x - 32) * 5/9,
+                "Кельвин (K)": lambda x: (x + 459.67) * 5/9,
+                "Ранкин (°R)": lambda x: x + 459.67,
+                "Реомюр (°Ré)": lambda x: (x - 32) * 4/9
+            },
+            "Кельвин (K)": {
+                "Цельсий (°C)": lambda x: x - 273.15,
+                "Фаренгейт (°F)": lambda x: (x * 9/5) - 459.67,
+                "Ранкин (°R)": lambda x: x * 9/5,
+                "Реомюр (°Ré)": lambda x: (x - 273.15) * 4/5
+            }
+        }
+    }
+
+    @classmethod
+    def convert_temperature(cls, value: float, from_unit: str, to_unit: str) -> float:
+        """Конвертация температуры с поддержкой всех шкал"""
         if from_unit == to_unit:
             return value
         
-        # Конвертируем в Кельвины как промежуточную единицу
-        if "Цельсий" in from_unit:
-            kelvin = value + 273.15
-        elif "Фаренгейт" in from_unit:
-            kelvin = (value - 32) * 5/9 + 273.15
-        elif "Кельвин" in from_unit:
-            kelvin = value
+        # Проверяем наличие формулы
+        for base_unit, conversions in cls.FORMULAS["температура"].items():
+            if base_unit in from_unit and to_unit in conversions:
+                return conversions[to_unit](value)
         
-        # Проверка абсолютного нуля
-        if kelvin < 0:
-            raise ValueError("❌ Температура не может быть ниже абсолютного нуля (-273.15°C)")
+        # Если нет прямой формулы, используем Цельсий как промежуточную
+        if "Цельсий" not in from_unit:
+            # Конвертируем в Цельсий
+            if "Фаренгейт" in from_unit:
+                celsius = (value - 32) * 5/9
+            elif "Кельвин" in from_unit:
+                celsius = value - 273.15
+            elif "Ранкин" in from_unit:
+                celsius = (value - 491.67) * 5/9
+            elif "Реомюр" in from_unit:
+                celsius = value * 5/4
+            else:
+                raise ValueError(f"Неизвестная единица температуры: {from_unit}")
+        else:
+            celsius = value
         
-        # Конвертируем из Кельвинов в целевую единицу
-        if "Цельсий" in to_unit:
-            return kelvin - 273.15
-        elif "Фаренгейт" in to_unit:
-            return (kelvin - 273.15) * 9/5 + 32
+        # Конвертируем из Цельсия в целевую единицу
+        if "Фаренгейт" in to_unit:
+            return (celsius * 9/5) + 32
         elif "Кельвин" in to_unit:
-            return kelvin
-    
-    @staticmethod
-    def convert_standard(value: float, from_unit: str, to_unit: str, from_category: str) -> float:
+            return celsius + 273.15
+        elif "Ранкин" in to_unit:
+            return (celsius + 273.15) * 9/5
+        elif "Реомюр" in to_unit:
+            return celsius * 4/5
+        else:
+            raise ValueError(f"Неизвестная единица температуры: {to_unit}")
+
+    @classmethod
+    def convert_standard(cls, value: float, from_unit: str, to_unit: str, category: str) -> float:
         """Конвертация стандартных величин"""
-        # Находим коэффициенты для обеих единиц
-        factor_from = None
-        factor_to = None
+        if category not in cls.PHYSICAL_QUANTITIES:
+            raise ValueError(f"Неизвестная категория: {category}")
         
-        for category in COMPATIBLE_CATEGORIES.get(from_category, []):
-            if from_unit in PHYSICAL_QUANTITIES.get(category, {}):
-                factor_from = PHYSICAL_QUANTITIES[category][from_unit]
-            if to_unit in PHYSICAL_QUANTITIES.get(category, {}):
-                factor_to = PHYSICAL_QUANTITIES[category][to_unit]
+        units_dict = cls.PHYSICAL_QUANTITIES[category]
         
-        if factor_from is None or factor_to is None:
-            raise ValueError(f"❌ Не удалось найти коэффициенты для конвертации")
+        if from_unit not in units_dict or to_unit not in units_dict:
+            raise ValueError(f"Неизвестные единицы измерения")
         
-        # Выполняем конвертацию
-        return value * factor_from / factor_to
-    
+        from_data = units_dict[from_unit]
+        to_data = units_dict[to_unit]
+        
+        # Для температур используем специальный метод
+        if from_data.get("type") == "temperature" or to_data.get("type") == "temperature":
+            return cls.convert_temperature(value, from_unit, to_unit)
+        
+        # Стандартная линейная конвертация
+        from_factor = from_data["factor"]
+        to_factor = to_data["factor"]
+        
+        return value * from_factor / to_factor
+
+    @classmethod
+    def get_compatible_categories(cls, category: str) -> List[str]:
+        """Получить список совместимых категорий"""
+        compatible = {
+            "Длина": ["Длина", "Древнерусские меры длины"],
+            "Древнерусские меры длины": ["Длина", "Древнерусские меры длины"],
+        }
+        
+        # По умолчанию категория совместима только сама с собой
+        return compatible.get(category, [category])
+
+    @classmethod
+    def get_compatible_units(cls, category: str) -> Dict[str, Any]:
+        """Получить все совместимые единицы измерения"""
+        compatible_categories = cls.get_compatible_categories(category)
+        result = {}
+        
+        for cat in compatible_categories:
+            if cat in cls.PHYSICAL_QUANTITIES:
+                result.update(cls.PHYSICAL_QUANTITIES[cat])
+        
+        return result
+
     @staticmethod
-    def format_result(value: float) -> str:
-        """Форматирование результата для лучшей читаемости"""
+    def format_result(value: float, precision: int = 8) -> str:
+        """Умное форматирование результата"""
         if value == 0:
             return "0"
         
         abs_value = abs(value)
         
-        if abs_value < 1e-6 or abs_value > 1e9:
-            return f"{value:.6e}".replace('e-0', 'e-').replace('e+0', 'e+')
-        elif abs_value < 0.001:
-            return f"{value:.8f}".rstrip('0').rstrip('.')
+        # Для очень больших или очень маленьких чисел используем научную нотацию
+        if abs_value < 1e-6 or abs_value > 1e12:
+            return f"{value:.{precision}e}".replace('e-0', 'e-').replace('e+0', 'e+')
+        
+        # Определяем оптимальное количество знаков после запятой
+        if abs_value < 0.001:
+            decimals = 8
         elif abs_value < 1:
-            return f"{value:.6f}".rstrip('0').rstrip('.')
+            decimals = 6
         elif abs_value < 1000:
-            return f"{value:.4f}".rstrip('0').rstrip('.')
+            decimals = 4
         else:
-            return f"{value:.2f}".rstrip('0').rstrip('.')
-    
+            decimals = 2
+        
+        formatted = f"{value:.{decimals}f}".rstrip('0').rstrip('.')
+        
+        # Добавляем разделители тысяч для больших чисел
+        if '.' in formatted:
+            int_part, dec_part = formatted.split('.')
+        else:
+            int_part, dec_part = formatted, ""
+        
+        if len(int_part) > 3:
+            int_part = f"{int(int_part):,}".replace(',', ' ')
+        
+        return f"{int_part}.{dec_part}" if dec_part else int_part
+
     @staticmethod
     def validate_input(text: str) -> Tuple[bool, Optional[float], Optional[str]]:
-        """Валидация введенного значения"""
+        """Расширенная валидация ввода с поддержкой формул"""
         try:
-            cleaned = text.replace(',', '.').replace(' ', '')
+            cleaned = text.strip().replace(',', '.').replace(' ', '')
             
-            if cleaned.lower() in ['pi', 'π']:
-                return True, math.pi, None
-            elif cleaned.lower() == 'e':
-                return True, math.e, None
+            # Специальные константы
+            constants = {
+                'pi': math.pi, 'π': math.pi,
+                'e': math.e,
+                'phi': 1.6180339887, 'φ': 1.6180339887,
+                'c': 299792458,  # скорость света
+                'g': 9.80665,    # ускорение свободного падения
+            }
             
+            if cleaned.lower() in constants:
+                return True, constants[cleaned.lower()], None
+            
+            # Поддержка дробей
             if '/' in cleaned:
                 parts = cleaned.split('/')
                 if len(parts) == 2:
@@ -253,445 +444,876 @@ class UnitConverter:
                         return False, None, "❌ Деление на ноль невозможно"
                     return True, numerator / denominator, None
             
+            # Поддержка простых математических выражений
+            if any(op in cleaned for op in ['+', '-', '*', '^']):
+                # Заменяем ^ на ** для возведения в степень
+                cleaned = cleaned.replace('^', '**')
+                # Безопасное вычисление выражения
+                try:
+                    result = eval(cleaned, {"__builtins__": None}, {
+                        "sin": math.sin, "cos": math.cos, "tan": math.tan,
+                        "sqrt": math.sqrt, "log": math.log, "log10": math.log10,
+                        "exp": math.exp, "pi": math.pi, "e": math.e
+                    })
+                    if isinstance(result, (int, float)):
+                        return True, float(result), None
+                except:
+                    pass
+            
+            # Простое число
             value = float(cleaned)
+            
+            # Проверка на разумные пределы
+            if abs(value) > 1e100:
+                return False, None, "❌ Слишком большое число"
+            if abs(value) < 1e-100 and value != 0:
+                return False, None, "❌ Слишком маленькое число"
+            
             return True, value, None
             
         except ValueError:
-            return False, None, "❌ Пожалуйста, введите корректное числовое значение\nПример: 10, 15.5, 1/2, -40, 0.25, pi"
+            return False, None, "❌ Пожалуйста, введите корректное числовое значение\nПример: 10, 15.5, 1/2, -40, 0.25, pi, sin(30), 2^8"
 
-class DatabaseManager:
-    """Менеджер для работы с базой данных"""
+class AdvancedDatabaseManager:
+    """Усовершенствованный менеджер базы данных"""
     
-    @staticmethod
-    def save_conversion_history(user_id: int, from_value: float, from_unit: str, 
-                              to_value: float, to_unit: str):
-        """Сохранение истории конвертаций"""
-        with get_db_connection() as conn:
-            conn.execute(
-                "INSERT INTO conversion_history (user_id, from_value, from_unit, to_value, to_unit) VALUES (?, ?, ?, ?, ?)",
-                (user_id, from_value, from_unit, to_value, to_unit)
-            )
+    def __init__(self):
+        self.init_database()
+    
+    def init_database(self):
+        """Инициализация расширенной базы данных"""
+        with self.get_db_connection() as conn:
+            # Основные таблицы
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS user_favorites (
+                    user_id INTEGER,
+                    favorite_name TEXT,
+                    from_unit TEXT,
+                    to_unit TEXT,
+                    category TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (user_id, favorite_name)
+                )
+            ''')
             
             conn.execute('''
-                INSERT OR REPLACE INTO user_stats (user_id, conversions_count, last_activity)
+                CREATE TABLE IF NOT EXISTS conversion_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    from_value REAL,
+                    from_unit TEXT,
+                    to_value REAL,
+                    to_unit TEXT,
+                    category TEXT,
+                    converted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS user_stats (
+                    user_id INTEGER PRIMARY KEY,
+                    conversions_count INTEGER DEFAULT 0,
+                    favorites_count INTEGER DEFAULT 0,
+                    last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS user_settings (
+                    user_id INTEGER PRIMARY KEY,
+                    language TEXT DEFAULT 'ru',
+                    precision INTEGER DEFAULT 6,
+                    notation TEXT DEFAULT 'auto',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Таблица для кэша курсов валют (если добавим в будущем)
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS exchange_rates (
+                    base_currency TEXT,
+                    target_currency TEXT,
+                    rate REAL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (base_currency, target_currency)
+                )
+            ''')
+    
+    @contextmanager
+    def get_db_connection(self):
+        """Контекстный менеджер для подключения к БД"""
+        conn = sqlite3.connect('converter_bot_advanced.db', check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+    
+    def save_conversion(self, user_id: int, conversion: ConversionResult):
+        """Сохранение конвертации в историю"""
+        with self.get_db_connection() as conn:
+            conn.execute('''
+                INSERT INTO conversion_history 
+                (user_id, from_value, from_unit, to_value, to_unit, category)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (user_id, conversion.value, conversion.unit_from, 
+                  conversion.result, conversion.unit_to, conversion.category))
+            
+            # Обновляем статистику
+            conn.execute('''
+                INSERT OR REPLACE INTO user_stats 
+                (user_id, conversions_count, last_activity)
                 VALUES (?, 
                     COALESCE((SELECT conversions_count FROM user_stats WHERE user_id = ?), 0) + 1,
                     CURRENT_TIMESTAMP)
             ''', (user_id, user_id))
     
-    @staticmethod
-    def get_user_favorites(user_id: int) -> List[Tuple]:
+    def get_user_favorites(self, user_id: int) -> List[Dict]:
         """Получение избранных конвертаций пользователя"""
-        with get_db_connection() as conn:
-            cursor = conn.execute(
-                "SELECT favorite_name, from_unit, to_unit FROM user_favorites WHERE user_id = ? ORDER BY created_at DESC",
-                (user_id,)
-            )
-            return cursor.fetchall()
+        with self.get_db_connection() as conn:
+            cursor = conn.execute('''
+                SELECT favorite_name, from_unit, to_unit, category 
+                FROM user_favorites 
+                WHERE user_id = ? 
+                ORDER BY created_at DESC
+            ''', (user_id,))
+            
+            return [dict(row) for row in cursor.fetchall()]
     
-    @staticmethod
-    def save_favorite(user_id: int, favorite_name: str, from_unit: str, to_unit: str):
+    def save_favorite(self, user_id: int, favorite_name: str, from_unit: str, 
+                     to_unit: str, category: str):
         """Сохранение избранной конвертации"""
-        with get_db_connection() as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO user_favorites (user_id, favorite_name, from_unit, to_unit) VALUES (?, ?, ?, ?)",
-                (user_id, favorite_name, from_unit, to_unit)
-            )
+        with self.get_db_connection() as conn:
+            conn.execute('''
+                INSERT OR REPLACE INTO user_favorites 
+                (user_id, favorite_name, from_unit, to_unit, category)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (user_id, favorite_name, from_unit, to_unit, category))
+            
+            # Обновляем счетчик избранного
+            conn.execute('''
+                UPDATE user_stats 
+                SET favorites_count = (
+                    SELECT COUNT(*) FROM user_favorites WHERE user_id = ?
+                )
+                WHERE user_id = ?
+            ''', (user_id, user_id))
     
-    @staticmethod
-    def delete_favorite(user_id: int, favorite_name: str):
+    def delete_favorite(self, user_id: int, favorite_name: str):
         """Удаление избранной конвертации"""
-        with get_db_connection() as conn:
-            conn.execute(
-                "DELETE FROM user_favorites WHERE user_id = ? AND favorite_name = ?",
-                (user_id, favorite_name)
-            )
+        with self.get_db_connection() as conn:
+            conn.execute('''
+                DELETE FROM user_favorites 
+                WHERE user_id = ? AND favorite_name = ?
+            ''', (user_id, favorite_name))
     
-    @staticmethod
-    def get_user_stats(user_id: int):
+    def is_favorite_name_unique(self, user_id: int, favorite_name: str) -> bool:
+        """Проверка уникальности имени избранного"""
+        with self.get_db_connection() as conn:
+            cursor = conn.execute('''
+                SELECT 1 FROM user_favorites 
+                WHERE user_id = ? AND favorite_name = ?
+            ''', (user_id, favorite_name))
+            return cursor.fetchone() is None
+    
+    def get_user_stats(self, user_id: int) -> Optional[Dict]:
         """Получение статистики пользователя"""
-        with get_db_connection() as conn:
-            cursor = conn.execute(
-                "SELECT conversions_count, last_activity FROM user_stats WHERE user_id = ?",
-                (user_id,)
-            )
-            return cursor.fetchone()
+        with self.get_db_connection() as conn:
+            cursor = conn.execute('''
+                SELECT conversions_count, favorites_count, last_activity, first_seen
+                FROM user_stats WHERE user_id = ?
+            ''', (user_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
     
-    @staticmethod
-    def get_recent_conversions(user_id: int, limit: int = 5):
+    def get_recent_conversions(self, user_id: int, limit: int = 10) -> List[Dict]:
         """Получение последних конвертаций пользователя"""
-        with get_db_connection() as conn:
-            cursor = conn.execute(
-                "SELECT from_value, from_unit, to_value, to_unit, converted_at "
-                "FROM conversion_history WHERE user_id = ? ORDER BY converted_at DESC LIMIT ?",
-                (user_id, limit)
-            )
-            return cursor.fetchall()
+        with self.get_db_connection() as conn:
+            cursor = conn.execute('''
+                SELECT from_value, from_unit, to_value, to_unit, category, converted_at
+                FROM conversion_history 
+                WHERE user_id = ? 
+                ORDER BY converted_at DESC 
+                LIMIT ?
+            ''', (user_id, limit))
+            return [dict(row) for row in cursor.fetchall()]
+    
+    def get_most_used_conversions(self, user_id: int, limit: int = 5) -> List[Dict]:
+        """Получение самых частых конвертаций"""
+        with self.get_db_connection() as conn:
+            cursor = conn.execute('''
+                SELECT from_unit, to_unit, COUNT(*) as usage_count
+                FROM conversion_history 
+                WHERE user_id = ?
+                GROUP BY from_unit, to_unit
+                ORDER BY usage_count DESC
+                LIMIT ?
+            ''', (user_id, limit))
+            return [dict(row) for row in cursor.fetchall()]
+    
+    def cleanup_old_history(self, days: int = 30):
+        """Очистка старой истории"""
+        with self.get_db_connection() as conn:
+            conn.execute('''
+                DELETE FROM conversion_history 
+                WHERE converted_at < datetime('now', ?)
+            ''', (f'-{days} days',))
 
-class KeyboardManager:
-    """Менеджер для создания клавиатур"""
+class InteractiveKeyboardManager:
+    """Менеджер интерактивных клавиатур"""
     
     @staticmethod
-    def create_main_keyboard():
-        """Создание основной клавиатуры"""
+    def create_main_menu() -> ReplyKeyboardMarkup:
+        """Главное меню"""
         keyboard = [
-            ["📊 Конвертировать", "⭐ Избранное"],
-            ["🚀 Быстрые конвертации", "📈 История"],
-            ["📚 Категории", "ℹ️ Помощь"]
+            ["🔄 Конвертировать", "⭐ Избранное"],
+            ["🚀 Быстрые конвертации", "📊 История и статистика"],
+            ["⚙️ Настройки", "ℹ️ Справка"]
+        ]
+        return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, input_field_placeholder="Выберите действие...")
+    
+    @staticmethod
+    def create_categories_menu() -> ReplyKeyboardMarkup:
+        """Меню категорий"""
+        categories = list(EnhancedUnitConverter.PHYSICAL_QUANTITIES.keys())
+        # Группируем по 2 категории в строке для лучшего отображения
+        rows = [categories[i:i+2] for i in range(0, len(categories), 2)]
+        rows.append(["🔙 Главное меню"])
+        return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+    
+    @staticmethod
+    def create_units_menu(units: List[str], back_text: str = "🔙 Назад") -> ReplyKeyboardMarkup:
+        """Меню единиц измерения"""
+        rows = [units[i:i+2] for i in range(0, len(units), 2)]
+        rows.append([back_text])
+        return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+    
+    @staticmethod
+    def create_quick_actions_menu() -> ReplyKeyboardMarkup:
+        """Меню быстрых действий"""
+        keyboard = [
+            ["📏 Дюймы → см", "⚖️ Фунты → кг", "🌡️ °F → °C"],
+            ["💻 Мбит → МБ/с", "🛣️ Мили → км", "📐 Футы → метры"],
+            ["🔙 Главное меню"]
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
     @staticmethod
-    def create_categories_keyboard():
-        """Создание клавиатуры с категориями"""
-        categories = list(PHYSICAL_QUANTITIES.keys())
-        keyboard = [categories[i:i+2] for i in range(0, len(categories), 2)]
-        keyboard.append(["🔙 Назад"])
-        return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    
-    @staticmethod
-    def create_units_keyboard(units: List[str], back_button: bool = True):
-        """Создание клавиатуры с единицами измерения"""
-        keyboard = [units[i:i+2] for i in range(0, len(units), 2)]
-        if back_button:
-            keyboard.append(["🔙 Назад"])
-        return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    
-    @staticmethod
-    def create_popular_conversions_keyboard():
-        """Создание клавиатуры с популярными конвертациями"""
-        keyboard = []
-        for name in POPULAR_CONVERSIONS.keys():
-            keyboard.append([name])
-        keyboard.append(["🔙 Назад"])
-        return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    
-    @staticmethod
-    def create_after_conversion_keyboard():
-        """Клавиатура после конвертации"""
+    def create_history_menu() -> ReplyKeyboardMarkup:
+        """Меню истории и статистики"""
         keyboard = [
-            ["⭐ Добавить в избранное", "📊 Новая конвертация"],
-            ["🚀 Быстрые конвертации", "📈 История"],
+            ["📈 Последние конвертации", "📊 Статистика"],
+            ["🏆 Частые конвертации", "🗑️ Очистить историю"],
+            ["🔙 Главное меню"]
+        ]
+        return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    
+    @staticmethod
+    def create_settings_menu() -> ReplyKeyboardMarkup:
+        """Меню настроек"""
+        keyboard = [
+            ["🎯 Точность вычислений", "🔤 Формат чисел"],
+            ["🗣️ Язык интерфейса", "📱 Тема оформления"],
+            ["🔙 Главное меню"]
+        ]
+        return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    
+    @staticmethod
+    def create_after_conversion_menu() -> ReplyKeyboardMarkup:
+        """Меню после конвертации"""
+        keyboard = [
+            ["⭐ Сохранить в избранное", "🔄 Новая конвертация"],
+            ["📊 Еще значения", "🚀 Быстрые конвертации"],
+            ["🔙 Главное меню"]
+        ]
+        return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    
+    @staticmethod
+    def create_favorites_menu() -> ReplyKeyboardMarkup:
+        """Меню избранного"""
+        keyboard = [
+            ["📋 Список избранного", "➕ Добавить в избранное"],
+            ["🗑️ Удалить избранное", "📤 Экспорт избранного"],
             ["🔙 Главное меню"]
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-class BotHandlers:
-    """Класс с обработчиками бота"""
+class AdvancedBotHandlers:
+    """Усовершенствованные обработчики бота"""
     
     def __init__(self):
-        self.converter = UnitConverter()
-        self.db = DatabaseManager()
-        self.keyboard = KeyboardManager()
+        self.converter = EnhancedUnitConverter()
+        self.db = AdvancedDatabaseManager()
+        self.keyboard = InteractiveKeyboardManager()
+        self.user_sessions = {}  # Кэш сессий пользователей
+    
+    def get_user_session(self, user_id: int) -> Dict:
+        """Получение или создание сессии пользователя"""
+        if user_id not in self.user_sessions:
+            self.user_sessions[user_id] = {
+                'last_activity': datetime.now(),
+                'conversion_count': 0,
+                'current_category': None,
+                'current_units': None
+            }
+        return self.user_sessions[user_id]
+    
+    def update_user_activity(self, user_id: int):
+        """Обновление активности пользователя"""
+        session = self.get_user_session(user_id)
+        session['last_activity'] = datetime.now()
     
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Обработчик команды /start"""
+        """Улучшенный обработчик команды /start"""
         user = update.effective_user
+        self.update_user_activity(user.id)
         
-        welcome_text = f"""👋 Привет, {user.first_name}!
+        welcome_text = f"""🎉 Добро пожаловать, {user.first_name}!
 
-🤖 Я - продвинутый бот для конвертации физических величин!
+🤖 *Умный конвертер физических величин* версии 2.0
 
-✨ Основные возможности:
-• 📊 Конвертация между различными системами измерений
-• ⭐ Избранные конвертации для быстрого доступа
-• 📈 История ваших конвертаций
-• 🚀 Быстрые популярные конвертации
-• 🔍 Поддержка древнерусских мер
+✨ *Новые возможности:*
+• 🔄 Конвертация 200+ единиц в 15+ категориях
+• ⭐ Умное избранное с быстрым доступом
+• 📊 Подробная статистика и аналитика
+• 🚀 Пакетная конвертация нескольких значений
+• 🎯 Поддержка математических выражений
+• 💾 Экспорт истории и избранного
+• ⚙️ Гибкие настройки отображения
 
-🎯 Начните с команды /convert или используйте кнопки ниже!"""
+📋 *Быстрый старт:*
+1. Нажмите `🔄 Конвертировать`
+2. Выберите категорию и единицы
+3. Введите значение (поддерживаются формулы!)
+
+💡 *Примеры ввода:*
+`10`, `15.5`, `1/2`, `sin(30)`, `2^8`, `pi/2`
+
+Начните с кнопки ниже! 👇"""
         
         await update.message.reply_text(
             welcome_text,
-            reply_markup=self.keyboard.create_main_keyboard()
+            reply_markup=self.keyboard.create_main_menu(),
+            parse_mode=ParseMode.MARKDOWN
         )
     
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Обработчик команды /help"""
-        help_text = """📋 Доступные команды:
+        """Расширенная справка"""
+        help_text = """📚 *Полное руководство пользователя*
 
-/start - Начать работу с ботом
-/convert - Конвертировать физические величины
-/favorites - Управление избранными конвертациями
+*Основные команды:*
+/start - Главное меню
+/convert - Начать конвертацию  
+/favorites - Управление избранным
 /history - История конвертаций
-/stats - Статистика использования
-/categories - Показать доступные категории
-/help - Показать эту справку
+/stats - Подробная статистика
+/settings - Настройки бота
+/help - Эта справка
 
-🔄 Как использовать:
+*🔄 Процесс конвертации:*
+1. Выберите категорию измерения
+2. Выберите исходную и целевую единицы
+3. Введите значение для конвертации
 
-1. Обычная конвертация:
-   - Нажмите "📊 Конвертировать"
-   - Выберите категорию
-   - Выберите исходную и целевую единицы
-   - Введите значение
+*🔢 Поддерживаемые форматы ввода:*
+• Целые числа: `10`, `-5`, `1000`
+• Дроби: `1/2`, `3/4`, `15/16`
+• Десятичные: `15.5`, `0.25`, `-3.14`
+• Научная нотация: `1.23e-5`, `5.67e8`
+• Константы: `pi`, `e`, `φ` (фи)
+• Формулы: `sin(30)`, `2^8`, `sqrt(16)`, `log(100)`
 
-2. Быстрые конвертации:
-   - Нажмите "🚀 Быстрые конвертации"
-   - Выберите нужный вариант
+*🚀 Быстрые конвертации:*
+• Дюймы ↔ сантиметры
+• Фунты ↔ килограммы
+• Фаренгейты ↔ Цельсии
+• Мили ↔ километры
+• И многое другое!
 
-🔢 Поддерживаемые форматы ввода:
-- Целые числа: 10, -5, 1000
-- Десятичные дроби: 15.5, 0.25, -3.14
-- Дроби: 1/2, 3/4, 15/16
-- Константы: pi, π, e"""
-        await update.message.reply_text(help_text)
-    
-    async def show_categories(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Показать доступные категории"""
-        categories_text = "📚 Доступные категории величин:\n\n"
+*💡 Советы:*
+• Используйте избранное для частых конвертаций
+• Просматривайте историю для повтора операций
+• Настройте точность вычислений под ваши нужды"""
         
-        for category in PHYSICAL_QUANTITIES.keys():
-            units_count = len(PHYSICAL_QUANTITIES[category])
-            categories_text += f"• {category} - {units_count} единиц\n"
+        await update.message.reply_text(
+            help_text,
+            reply_markup=self.keyboard.create_main_menu(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def show_categories(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Показать категории для конвертации"""
+        self.update_user_activity(update.effective_user.id)
+        
+        categories_text = "📚 *Выберите категорию измерения:*\n\n"
+        for category, units in self.converter.PHYSICAL_QUANTITIES.items():
+            units_count = len(units)
+            categories_text += f"• *{category}* - {units_count} единиц\n"
         
         await update.message.reply_text(
             categories_text,
-            reply_markup=self.keyboard.create_main_keyboard()
+            reply_markup=self.keyboard.create_categories_menu(),
+            parse_mode=ParseMode.MARKDOWN
         )
+        return BotState.SELECT_CATEGORY.value
     
-    async def convert_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Начало процесса конвертации"""
-        await update.message.reply_text(
-            "📊 Выберите категорию физической величины:",
-            reply_markup=self.keyboard.create_categories_keyboard()
-        )
-        return SELECT_CATEGORY
-    
-    async def select_category(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    async def handle_category_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Обработка выбора категории"""
+        user_id = update.effective_user.id
         category = update.message.text
+        self.update_user_activity(user_id)
         
-        if category == "🔙 Назад":
+        if category == "🔙 Главное меню":
             await update.message.reply_text(
                 "Главное меню:",
-                reply_markup=self.keyboard.create_main_keyboard()
+                reply_markup=self.keyboard.create_main_menu()
             )
             return ConversationHandler.END
         
-        if category not in PHYSICAL_QUANTITIES:
-            await update.message.reply_text("❌ Пожалуйста, выберите категорию из предложенных вариантов.")
-            return SELECT_CATEGORY
+        if category not in self.converter.PHYSICAL_QUANTITIES:
+            await update.message.reply_text(
+                "❌ Пожалуйста, выберите категорию из предложенных вариантов.",
+                reply_markup=self.keyboard.create_categories_menu()
+            )
+            return BotState.SELECT_CATEGORY.value
         
-        context.user_data['category'] = category
-        units = list(PHYSICAL_QUANTITIES[category].keys())
+        # Сохраняем выбранную категорию в сессии
+        session = self.get_user_session(user_id)
+        session['current_category'] = category
+        
+        units = list(self.converter.PHYSICAL_QUANTITIES[category].keys())
         
         await update.message.reply_text(
-            f"📏 Выберите исходную единицу измерения для {category}:",
-            reply_markup=self.keyboard.create_units_keyboard(units)
+            f"📏 *{category}*\n\nВыберите исходную единицу измерения:",
+            reply_markup=self.keyboard.create_units_menu(units),
+            parse_mode=ParseMode.MARKDOWN
         )
-        return SELECT_UNIT_FROM
+        return BotState.SELECT_UNIT_FROM.value
     
-    async def select_unit_from(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Обработка выбора исходной единицы измерения"""
+    async def handle_unit_from_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Обработка выбора исходной единицы"""
+        user_id = update.effective_user.id
         unit_from = update.message.text
+        self.update_user_activity(user_id)
         
         if unit_from == "🔙 Назад":
             await update.message.reply_text(
-                "📊 Выберите категорию:",
-                reply_markup=self.keyboard.create_categories_keyboard()
+                "📚 Выберите категорию:",
+                reply_markup=self.keyboard.create_categories_menu()
             )
-            return SELECT_CATEGORY
+            return BotState.SELECT_CATEGORY.value
         
-        category = context.user_data['category']
+        session = self.get_user_session(user_id)
+        category = session.get('current_category')
         
-        if unit_from not in PHYSICAL_QUANTITIES[category]:
-            await update.message.reply_text("❌ Пожалуйста, выберите единицу измерения из предложенных вариантов.")
-            return SELECT_UNIT_FROM
+        if not category or unit_from not in self.converter.PHYSICAL_QUANTITIES.get(category, {}):
+            await update.message.reply_text(
+                "❌ Пожалуйста, выберите единицу измерения из предложенных вариантов.",
+                reply_markup=self.keyboard.create_categories_menu()
+            )
+            return BotState.SELECT_CATEGORY.value
         
-        context.user_data['unit_from'] = unit_from
+        session['unit_from'] = unit_from
         
-        # Получаем все совместимые единицы
-        compatible_units = self._get_compatible_units(category)
-        units_list = list(compatible_units.keys())
-        
-        # Убираем уже выбранную единицу
-        if unit_from in units_list:
-            units_list.remove(unit_from)
+        # Получаем совместимые единицы
+        compatible_units = self.converter.get_compatible_units(category)
+        available_units = [unit for unit in compatible_units.keys() if unit != unit_from]
         
         await update.message.reply_text(
-            "🎯 Выберите целевую единицу измерения:\n(доступны единицы из совместимых категорий)",
-            reply_markup=self.keyboard.create_units_keyboard(units_list)
+            f"🎯 *Целевая единица*\n\nИз: {unit_from}\n\nВыберите целевую единицу:",
+            reply_markup=self.keyboard.create_units_menu(available_units),
+            parse_mode=ParseMode.MARKDOWN
         )
-        return SELECT_UNIT_TO
+        return BotState.SELECT_UNIT_TO.value
     
-    async def select_unit_to(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Обработка выбора целевой единицы измерения"""
+    async def handle_unit_to_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Обработка выбора целевой единицы"""
+        user_id = update.effective_user.id
         unit_to = update.message.text
+        self.update_user_activity(user_id)
         
         if unit_to == "🔙 Назад":
-            category = context.user_data['category']
-            units = list(PHYSICAL_QUANTITIES[category].keys())
-            
+            session = self.get_user_session(user_id)
+            category = session.get('current_category')
+            if category:
+                units = list(self.converter.PHYSICAL_QUANTITIES[category].keys())
+                await update.message.reply_text(
+                    f"📏 Выберите исходную единицу для {category}:",
+                    reply_markup=self.keyboard.create_units_menu(units)
+                )
+                return BotState.SELECT_UNIT_FROM.value
+        
+        session = self.get_user_session(user_id)
+        category = session.get('current_category')
+        unit_from = session.get('unit_from')
+        
+        if not all([category, unit_from]):
             await update.message.reply_text(
-                f"📏 Выберите исходную единицу измерения для {category}:",
-                reply_markup=self.keyboard.create_units_keyboard(units)
+                "❌ Сессия устарела. Начните заново.",
+                reply_markup=self.keyboard.create_main_menu()
             )
-            return SELECT_UNIT_FROM
+            return ConversationHandler.END
         
-        from_category = context.user_data['category']
-        
-        # Проверяем, что выбранная единица совместима
-        compatible_units = self._get_compatible_units(from_category)
+        # Проверяем совместимость единиц
+        compatible_units = self.converter.get_compatible_units(category)
         if unit_to not in compatible_units:
             await update.message.reply_text(
-                "❌ Эта единица несовместима с выбранной исходной единицей.\n"
-                "Пожалуйста, выберите единицу из предложенных вариантов."
+                "❌ Выбранные единицы несовместимы. Пожалуйста, выберите другую единицу.",
+                reply_markup=self.keyboard.create_units_menu(
+                    [unit for unit in compatible_units.keys() if unit != unit_from]
+                )
             )
-            return SELECT_UNIT_TO
+            return BotState.SELECT_UNIT_TO.value
         
-        context.user_data['unit_to'] = unit_to
+        session['unit_to'] = unit_to
         
-        # Определяем категорию целевой единицы
-        to_category = self._find_unit_category(unit_to)
-        context.user_data['to_category'] = to_category
+        # Создаем подсказку для пользователя
+        hint = self._get_conversion_hint(unit_from, unit_to)
         
-        # Показываем подсказки
-        hint = self._get_conversion_hint(context.user_data['unit_from'], unit_to)
+        input_text = (
+            f"🔢 *Введите значение для конвертации*\n\n"
+            f"*Из:* {unit_from}\n"
+            f"*В:* {unit_to}\n\n"
+            f"{hint}\n"
+            f"*Поддерживаемые форматы:*\n"
+            f"• Числа: `10`, `15.5`, `-40`\n"
+            f"• Дроби: `1/2`, `3/4`\n"
+            f"• Формулы: `sin(30)`, `2^8`, `pi/2`\n"
+            f"• Константы: `pi`, `e`, `φ`"
+        )
         
         await update.message.reply_text(
-            f"🔢 Введите значение для конвертации:\n\n"
-            f"Из: {context.user_data['unit_from']} ({from_category})\n"
-            f"В: {unit_to} ({to_category})\n\n"
-            f"{hint}\n"
-            f"Можно вводить: 10, 15.5, 1/2, -40, 0.25, pi",
-            reply_markup=ReplyKeyboardMarkup([["🔙 Назад"]], resize_keyboard=True)
+            input_text,
+            reply_markup=ReplyKeyboardMarkup([["🔙 Назад"]], resize_keyboard=True),
+            parse_mode=ParseMode.MARKDOWN
         )
-        return ENTER_VALUE
+        return BotState.ENTER_VALUE.value
     
-    async def enter_value(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    async def handle_value_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Обработка ввода значения и выполнение конвертации"""
         user_id = update.effective_user.id
         value_text = update.message.text
+        self.update_user_activity(user_id)
         
         if value_text == "🔙 Назад":
-            from_category = context.user_data['category']
-            compatible_units = self._get_compatible_units(from_category)
-            units_list = list(compatible_units.keys())
-            units_list.remove(context.user_data['unit_from'])
+            session = self.get_user_session(user_id)
+            category = session.get('current_category')
+            unit_from = session.get('unit_from')
             
-            await update.message.reply_text(
-                "🎯 Выберите целевую единицу измерения:",
-                reply_markup=self.keyboard.create_units_keyboard(units_list)
-            )
-            return SELECT_UNIT_TO
+            if category and unit_from:
+                compatible_units = self.converter.get_compatible_units(category)
+                available_units = [unit for unit in compatible_units.keys() if unit != unit_from]
+                
+                await update.message.reply_text(
+                    "🎯 Выберите целевую единицу:",
+                    reply_markup=self.keyboard.create_units_menu(available_units)
+                )
+                return BotState.SELECT_UNIT_TO.value
         
         # Валидация ввода
-        is_valid, value, error_message = self.converter.validate_input(value_text)
+        is_valid, value, error_message = EnhancedUnitConverter.validate_input(value_text)
         
         if not is_valid:
             await update.message.reply_text(error_message)
-            return ENTER_VALUE
+            return BotState.ENTER_VALUE.value
         
-        from_category = context.user_data['category']
-        unit_from = context.user_data['unit_from']
-        unit_to = context.user_data['unit_to']
-        to_category = context.user_data.get('to_category', 'Неизвестно')
+        session = self.get_user_session(user_id)
+        category = session.get('current_category')
+        unit_from = session.get('unit_from')
+        unit_to = session.get('unit_to')
+        
+        if not all([category, unit_from, unit_to]):
+            await update.message.reply_text(
+                "❌ Ошибка сессии. Пожалуйста, начните заново.",
+                reply_markup=self.keyboard.create_main_menu()
+            )
+            return ConversationHandler.END
         
         try:
             # Выполняем конвертацию
-            if from_category == "Температура" or to_category == "Температура":
+            if category == "Температура":
                 result = self.converter.convert_temperature(value, unit_from, unit_to)
             else:
-                result = self.converter.convert_standard(value, unit_from, unit_to, from_category)
+                result = self.converter.convert_standard(value, unit_from, unit_to, category)
+            
+            # Проверка на специальные значения
+            if math.isinf(result) or math.isnan(result):
+                await update.message.reply_text(
+                    "❌ Результат конвертации выходит за допустимые пределы",
+                    reply_markup=self.keyboard.create_main_menu()
+                )
+                return ConversationHandler.END
             
             # Форматируем результат
             result_str = self.converter.format_result(result)
+            value_str = self.converter.format_result(value)
             
-            # Сохраняем в историю
-            self.db.save_conversion_history(user_id, value, unit_from, result, unit_to)
-            
-            # Создаем красивый вывод
-            category_info = ""
-            if from_category != to_category:
-                category_info = f"🔀 Конвертация между системами: {from_category} → {to_category}\n\n"
-            
-            response_text = (
-                f"✅ Результат конвертации:\n\n"
-                f"{category_info}"
-                f"```\n{value} {unit_from} = {result_str} {unit_to}\n```\n"
-                f"💾 Конвертация сохранена в истории"
+            # Создаем объект результата
+            conversion_result = ConversionResult(
+                value=value,
+                unit_from=unit_from,
+                unit_to=unit_to,
+                result=result,
+                category=category,
+                timestamp=datetime.now()
             )
             
-            # Сохраняем данные для возможного добавления в избранное
-            context.user_data['last_conversion'] = {
-                'from_value': value,
-                'from_unit': unit_from,
-                'to_value': result,
-                'to_unit': unit_to
-            }
+            # Сохраняем в базу данных
+            self.db.save_conversion(user_id, conversion_result)
+            
+            # Обновляем сессию
+            session['conversion_count'] += 1
+            session['last_conversion'] = conversion_result
+            
+            # Формируем красивый ответ
+            response = self._format_conversion_response(conversion_result, value_str, result_str)
             
             await update.message.reply_text(
-                response_text,
-                reply_markup=self.keyboard.create_after_conversion_keyboard(),
-                parse_mode='Markdown'
+                response,
+                reply_markup=self.keyboard.create_after_conversion_menu(),
+                parse_mode=ParseMode.MARKDOWN
             )
             
-            return SAVE_FAVORITE
+            return BotState.SAVE_FAVORITE.value
             
         except Exception as e:
             logger.error(f"Ошибка конвертации: {e}")
             await update.message.reply_text(
-                f"❌ Произошла ошибка при конвертации: {str(e)}\n"
-                f"Пожалуйста, попробуйте снова.",
-                reply_markup=self.keyboard.create_main_keyboard()
+                f"❌ Ошибка при конвертации: {str(e)}\nПожалуйста, попробуйте снова.",
+                reply_markup=self.keyboard.create_main_menu()
             )
             return ConversationHandler.END
     
-    async def save_favorite_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Обработчик для сохранения в избранное"""
+    async def handle_after_conversion(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Обработка действий после конвертации"""
         user_input = update.message.text
+        user_id = update.effective_user.id
+        self.update_user_activity(user_id)
         
         if user_input == "🔙 Главное меню":
             await update.message.reply_text(
                 "Главное меню:",
-                reply_markup=self.keyboard.create_main_keyboard()
+                reply_markup=self.keyboard.create_main_menu()
             )
             return ConversationHandler.END
         
-        elif user_input == "📊 Новая конвертация":
-            await self.convert_start(update, context)
-            return SELECT_CATEGORY
+        elif user_input == "🔄 Новая конвертация":
+            return await self.show_categories(update, context)
+        
+        elif user_input == "📊 Еще значения":
+            session = self.get_user_session(user_id)
+            if 'unit_from' in session and 'unit_to' in session:
+                await update.message.reply_text(
+                    "🔢 Введите следующее значение для конвертации:",
+                    reply_markup=ReplyKeyboardMarkup([["🔙 Назад"]], resize_keyboard=True)
+                )
+                return BotState.ENTER_VALUE.value
+        
+        elif user_input == "⭐ Сохранить в избранное":
+            session = self.get_user_session(user_id)
+            if 'last_conversion' in session:
+                conversion = session['last_conversion']
+                favorite_name = f"{conversion.unit_from} → {conversion.unit_to}"
+                
+                if not self.db.is_favorite_name_unique(user_id, favorite_name):
+                    await update.message.reply_text(
+                        f"❌ Конвертация \"{favorite_name}\" уже есть в избранном",
+                        reply_markup=self.keyboard.create_main_menu()
+                    )
+                    return ConversationHandler.END
+                
+                self.db.save_favorite(
+                    user_id, favorite_name, 
+                    conversion.unit_from, conversion.unit_to, conversion.category
+                )
+                
+                await update.message.reply_text(
+                    f"✅ Конвертация сохранена в избранное как:\n\"{favorite_name}\"",
+                    reply_markup=self.keyboard.create_main_menu()
+                )
+            else:
+                await update.message.reply_text(
+                    "❌ Нет данных для сохранения",
+                    reply_markup=self.keyboard.create_main_menu()
+                )
+            return ConversationHandler.END
         
         elif user_input == "🚀 Быстрые конвертации":
-            await self.show_popular_conversions(update, context)
-            return ConversationHandler.END
-        
-        elif user_input == "📈 История":
-            await self.show_history(update, context)
-            return ConversationHandler.END
-        
-        elif user_input == "⭐ Добавить в избранное":
-            if 'last_conversion' not in context.user_data:
-                await update.message.reply_text("❌ Нет данных для сохранения в избранное")
-                return SAVE_FAVORITE
-            
-            conversion = context.user_data['last_conversion']
-            favorite_name = f"{conversion['from_unit']} → {conversion['to_unit']}"
-            
-            self.db.save_favorite(
-                update.effective_user.id,
-                favorite_name,
-                conversion['from_unit'],
-                conversion['to_unit']
-            )
-            
-            await update.message.reply_text(
-                f"✅ Конвертация добавлена в избранное как:\n\"{favorite_name}\"",
-                reply_markup=self.keyboard.create_main_keyboard()
-            )
+            await self.show_quick_conversions(update, context)
             return ConversationHandler.END
         
         else:
             await update.message.reply_text(
                 "Пожалуйста, используйте кнопки для выбора действия",
-                reply_markup=self.keyboard.create_main_keyboard()
+                reply_markup=self.keyboard.create_main_menu()
             )
             return ConversationHandler.END
     
-    async def show_favorites(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Показать избранные конвертации"""
+    async def show_quick_conversions(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Показать быстрые конвертации"""
+        quick_text = """🚀 *Быстрые конвертации*
+
+Выберите один из популярных вариантов для мгновенной конвертации:"""
+        
+        await update.message.reply_text(
+            quick_text,
+            reply_markup=self.keyboard.create_quick_actions_menu(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def handle_quick_conversion(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Обработка быстрой конвертации"""
+        conversion_type = update.message.text
+        self.update_user_activity(update.effective_user.id)
+        
+        if conversion_type == "🔙 Главное меню":
+            await update.message.reply_text(
+                "Главное меню:",
+                reply_markup=self.keyboard.create_main_menu()
+            )
+            return
+        
+        # Предопределенные быстрые конвертации
+        quick_conversions = {
+            "📏 Дюймы → см": (10, "дюйм (in)", "сантиметр (см)", "Длина"),
+            "⚖️ Фунты → кг": (1, "фунт (lb)", "килограмм (кг)", "Масса"),
+            "🌡️ °F → °C": (32, "Фаренгейт (°F)", "Цельсий (°C)", "Температура"),
+            "💻 Мбит → МБ/с": (100, "мегабит/сек (Mbps)", "мегабайт/сек (MBps)", "Скорость передачи данных"),
+            "🛣️ Мили → км": (1, "миля (mi)", "километр (км)", "Длина"),
+            "📐 Футы → метры": (6, "фут (ft)", "метр (м)", "Длина")
+        }
+        
+        if conversion_type in quick_conversions:
+            value, from_unit, to_unit, category = quick_conversions[conversion_type]
+            
+            try:
+                if category == "Температура":
+                    result = self.converter.convert_temperature(value, from_unit, to_unit)
+                else:
+                    result = self.converter.convert_standard(value, from_unit, to_unit, category)
+                
+                result_str = self.converter.format_result(result)
+                
+                # Сохраняем в историю
+                conversion_result = ConversionResult(
+                    value=value, unit_from=from_unit, unit_to=to_unit,
+                    result=result, category=category, timestamp=datetime.now()
+                )
+                self.db.save_conversion(update.effective_user.id, conversion_result)
+                
+                await update.message.reply_text(
+                    f"🚀 *Результат быстрой конвертации:*\n\n"
+                    f"```\n{value} {from_unit} = {result_str} {to_unit}\n```\n"
+                    f"Для точной настройки используйте обычную конвертацию",
+                    reply_markup=self.keyboard.create_main_menu(),
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                
+            except Exception as e:
+                await update.message.reply_text(
+                    f"❌ Ошибка при конвертации: {str(e)}",
+                    reply_markup=self.keyboard.create_main_menu()
+                )
+    
+    async def show_history_and_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Показать меню истории и статистики"""
+        await update.message.reply_text(
+            "📊 *История и статистика*\n\n"
+            "Выберите раздел для просмотра:",
+            reply_markup=self.keyboard.create_history_menu(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def show_recent_conversions(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Показать последние конвертации"""
         user_id = update.effective_user.id
+        self.update_user_activity(user_id)
+        
+        conversions = self.db.get_recent_conversions(user_id, 5)
+        
+        if not conversions:
+            await update.message.reply_text(
+                "📈 У вас пока нет истории конвертаций.\n\n"
+                "Выполните первую конвертацию, и она появится здесь!",
+                reply_markup=self.keyboard.create_history_menu()
+            )
+            return
+        
+        history_text = "📈 *Последние конвертации:*\n\n"
+        for i, conv in enumerate(conversions, 1):
+            date_str = datetime.strptime(conv['converted_at'], '%Y-%m-%d %H:%M:%S').strftime('%d.%m %H:%M')
+            from_val = self.converter.format_result(conv['from_value'])
+            to_val = self.converter.format_result(conv['to_value'])
+            history_text += f"*{i}.* {date_str}\n"
+            history_text += f"   `{from_val} {conv['from_unit']} → {to_val} {conv['to_unit']}`\n\n"
+        
+        await update.message.reply_text(
+            history_text,
+            reply_markup=self.keyboard.create_history_menu(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def show_user_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Показать подробную статистику пользователя"""
+        user_id = update.effective_user.id
+        self.update_user_activity(user_id)
+        
+        stats = self.db.get_user_stats(user_id)
+        
+        if not stats:
+            await update.message.reply_text(
+                "📊 У вас пока нет статистики.\n\n"
+                "Выполните первую конвертацию!",
+                reply_markup=self.keyboard.create_history_menu()
+            )
+            return
+        
+        # Получаем дополнительные данные
+        recent_conversions = self.db.get_recent_conversions(user_id, 1)
+        most_used = self.db.get_most_used_conversions(user_id, 3)
+        
+        last_active = datetime.strptime(stats['last_activity'], '%Y-%m-%d %H:%M:%S')
+        first_seen = datetime.strptime(stats['first_seen'], '%Y-%m-%d %H:%M:%S')
+        days_active = (datetime.now() - first_seen).days
+        
+        stats_text = (
+            f"📊 *Ваша статистика*\n\n"
+            f"• Всего конвертаций: *{stats['conversions_count']}*\n"
+            f"• Избранных конвертаций: *{stats['favorites_count']}*\n"
+            f"• Активность: *{days_active}* дней\n"
+            f"• Последняя активность: *{last_active.strftime('%d.%m.%Y %H:%M')}*\n\n"
+        )
+        
+        if most_used:
+            stats_text += "*Частые конвертации:*\n"
+            for i, conv in enumerate(most_used, 1):
+                stats_text += f"{i}. `{conv['from_unit']} → {conv['to_unit']}` - {conv['usage_count']} раз\n"
+        
+        await update.message.reply_text(
+            stats_text,
+            reply_markup=self.keyboard.create_history_menu(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def show_favorites_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Показать меню избранного"""
+        await update.message.reply_text(
+            "⭐ *Управление избранным*\n\n"
+            "Выберите действие:",
+            reply_markup=self.keyboard.create_favorites_menu(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def show_favorites_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Показать список избранных конвертаций"""
+        user_id = update.effective_user.id
+        self.update_user_activity(user_id)
+        
         favorites = self.db.get_user_favorites(user_id)
         
         if not favorites:
@@ -699,187 +1321,82 @@ class BotHandlers:
                 "⭐ У вас пока нет избранных конвертаций.\n\n"
                 "Чтобы добавить конвертацию в избранное:\n"
                 "1. Выполните обычную конвертацию\n"
-                "2. Нажмите кнопку \"⭐ Добавить в избранное\"",
-                reply_markup=self.keyboard.create_main_keyboard()
+                "2. Нажмите кнопку \"⭐ Сохранить в избранное\"",
+                reply_markup=self.keyboard.create_favorites_menu()
             )
             return
         
-        favorites_text = "⭐ Ваши избранные конвертации:\n\n"
-        for i, (name, from_unit, to_unit) in enumerate(favorites, 1):
-            favorites_text += f"{i}. {name}\n   {from_unit} → {to_unit}\n\n"
+        favorites_text = "⭐ *Ваши избранные конвертации:*\n\n"
+        for i, fav in enumerate(favorites, 1):
+            favorites_text += f"*{i}.* {fav['favorite_name']}\n"
+            favorites_text += f"   `{fav['from_unit']} → {fav['to_unit']}`\n\n"
         
+        # Создаем клавиатуру для быстрого доступа к избранному
         keyboard = []
-        for favorite in favorites:
-            keyboard.append([f"⭐ {favorite[0]}"])
+        for favorite in favorites[:5]:  # Показываем первые 5
+            keyboard.append([f"⭐ {favorite['favorite_name']}"])
         keyboard.append(["🔙 Главное меню"])
         
         await update.message.reply_text(
             favorites_text,
-            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
+            parse_mode=ParseMode.MARKDOWN
         )
     
-    async def show_popular_conversions(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Показать популярные конвертации"""
-        await update.message.reply_text(
-            "🚀 Выберите быструю конвертацию:\n\n"
-            "Эти конвертации часто используются и доступны в один клик!",
-            reply_markup=self.keyboard.create_popular_conversions_keyboard()
-        )
-    
-    async def handle_popular_conversion(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Обработка выбора популярной конвертации"""
-        conversion_name = update.message.text
+    async def handle_favorite_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Обработка выбора избранной конвертации"""
+        user_id = update.effective_user.id
+        favorite_name = update.message.text[2:]  # Убираем "⭐ "
+        self.update_user_activity(user_id)
         
-        if conversion_name == "🔙 Назад":
-            await update.message.reply_text(
-                "Главное меню:",
-                reply_markup=self.keyboard.create_main_keyboard()
-            )
-            return
+        favorites = self.db.get_user_favorites(user_id)
+        selected_favorite = next((f for f in favorites if f['favorite_name'] == favorite_name), None)
         
-        if conversion_name in POPULAR_CONVERSIONS:
-            from_unit, to_unit = POPULAR_CONVERSIONS[conversion_name]
+        if selected_favorite:
+            # Сохраняем выбранную конвертацию в сессии
+            session = self.get_user_session(user_id)
+            session.update({
+                'current_category': selected_favorite['category'],
+                'unit_from': selected_favorite['from_unit'],
+                'unit_to': selected_favorite['to_unit']
+            })
             
-            # Извлекаем значение из строки (например, "10 дюйм (in)" -> 10)
-            value_match = re.match(r'([\d.]+)', from_unit)
-            if value_match:
-                value = float(value_match.group(1))
-                from_unit_clean = from_unit.replace(value_match.group(1), '').strip()
-                
-                # Находим категории для единиц
-                from_category = self._find_unit_category(from_unit_clean)
-                to_category = self._find_unit_category(to_unit)
-                
-                try:
-                    # Выполняем конвертацию
-                    if from_category == "Температура" or to_category == "Температура":
-                        result = self.converter.convert_temperature(value, from_unit_clean, to_unit)
-                    else:
-                        result = self.converter.convert_standard(value, from_unit_clean, to_unit, from_category)
-                    
-                    result_str = self.converter.format_result(result)
-                    
-                    await update.message.reply_text(
-                        f"🚀 Результат быстрой конвертации:\n\n"
-                        f"```\n{value} {from_unit_clean} = {result_str} {to_unit}\n```\n"
-                        f"Для точной настройки используйте обычную конвертацию",
-                        reply_markup=self.keyboard.create_main_keyboard(),
-                        parse_mode='Markdown'
-                    )
-                    
-                except Exception as e:
-                    await update.message.reply_text(
-                        f"❌ Ошибка при конвертации: {str(e)}",
-                        reply_markup=self.keyboard.create_main_keyboard()
-                    )
-    
-    async def show_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Показать историю конвертаций"""
-        user_id = update.effective_user.id
-        recent_conversions = self.db.get_recent_conversions(user_id)
-        
-        if not recent_conversions:
             await update.message.reply_text(
-                "📈 У вас пока нет истории конвертаций.\n\n"
-                "Выполните первую конвертацию, и она появится здесь!",
-                reply_markup=self.keyboard.create_main_keyboard()
+                f"⭐ *{favorite_name}*\n\n"
+                f"Введите значение для конвертации:\n"
+                f"`{selected_favorite['from_unit']} → {selected_favorite['to_unit']}`",
+                reply_markup=ReplyKeyboardMarkup([["🔙 Назад"]], resize_keyboard=True),
+                parse_mode=ParseMode.MARKDOWN
             )
-            return
-        
-        history_text = "📈 Последние конвертации:\n\n"
-        for i, (from_value, from_unit, to_value, to_unit, converted_at) in enumerate(recent_conversions, 1):
-            date_str = datetime.strptime(converted_at, '%Y-%m-%d %H:%M:%S').strftime('%d.%m %H:%M')
-            history_text += f"{i}. {date_str}\n"
-            history_text += f"   {from_value} {from_unit} → {to_value:.4g} {to_unit}\n\n"
-        
-        stats = self.db.get_user_stats(user_id)
-        if stats:
-            history_text += f"📊 Всего конвертаций: {stats['conversions_count']}"
-        
-        await update.message.reply_text(
-            history_text,
-            reply_markup=self.keyboard.create_main_keyboard()
-        )
-    
-    async def show_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Показать статистику пользователя"""
-        user_id = update.effective_user.id
-        stats = self.db.get_user_stats(user_id)
-        
-        if not stats:
-            await update.message.reply_text(
-                "📊 У вас пока нет статистики.\n\n"
-                "Выполните первую конвертацию!",
-                reply_markup=self.keyboard.create_main_keyboard()
-            )
-            return
-        
-        last_active = datetime.strptime(stats['last_activity'], '%Y-%m-%d %H:%M:%S')
-        days_ago = (datetime.now() - last_active).days
-        
-        stats_text = (
-            f"📊 Ваша статистика:\n\n"
-            f"• Всего конвертаций: {stats['conversions_count']}\n"
-            f"• Последняя активность: {days_ago} дней назад\n"
-            f"• Поддерживаемых единиц: {sum(len(units) for units in PHYSICAL_QUANTITIES.values())}\n"
-            f"• Доступных категорий: {len(PHYSICAL_QUANTITIES)}"
-        )
-        
-        await update.message.reply_text(
-            stats_text,
-            reply_markup=self.keyboard.create_main_keyboard()
-        )
-    
-    async def handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Обработка текстовых сообщений"""
-        text = update.message.text
-        
-        if text == "📊 Конвертировать":
-            await self.convert_start(update, context)
-        elif text == "⭐ Избранное":
-            await self.show_favorites(update, context)
-        elif text == "🚀 Быстрые конвертации":
-            await self.show_popular_conversions(update, context)
-        elif text == "📈 История":
-            await self.show_history(update, context)
-        elif text == "📚 Категории":
-            await self.show_categories(update, context)
-        elif text == "ℹ️ Помощь":
-            await self.help_command(update, context)
+            
+            # Устанавливаем состояние для ввода значения
+            context.user_data['state'] = BotState.ENTER_VALUE.value
         else:
             await update.message.reply_text(
-                "🤖 Используйте кнопки ниже для навигации или команду /help для справки",
-                reply_markup=self.keyboard.create_main_keyboard()
+                "❌ Избранная конвертация не найдена",
+                reply_markup=self.keyboard.create_favorites_menu()
             )
     
-    def _get_compatible_units(self, from_category: str) -> Dict:
-        """Получить все совместимые единицы для данной категории"""
-        compatible_categories = COMPATIBLE_CATEGORIES.get(from_category, [])
-        all_units = {}
-        
-        for category in compatible_categories:
-            all_units.update(PHYSICAL_QUANTITIES.get(category, {}))
-        
-        return all_units
-    
-    def _find_unit_category(self, unit: str) -> str:
-        """Найти категорию для единицы измерения"""
-        for category, units in PHYSICAL_QUANTITIES.items():
-            if unit in units:
-                return category
-        return "Неизвестно"
+    async def show_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Показать меню настроек"""
+        await update.message.reply_text(
+            "⚙️ *Настройки бота*\n\n"
+            "Настройте параметры отображения и поведения:",
+            reply_markup=self.keyboard.create_settings_menu(),
+            parse_mode=ParseMode.MARKDOWN
+        )
     
     def _get_conversion_hint(self, from_unit: str, to_unit: str) -> str:
         """Получить подсказку для конвертации"""
         hints = {
-            ("верста", "километр (км)"): "💡 1 верста = 1.0668 км",
-            ("сажень", "метр (м)"): "💡 1 сажень = 2.1336 м",
-            ("аршин", "метр (м)"): "💡 1 аршин = 0.7112 м",
+            ("верста", "километр (км)"): "💡 1 верста ≈ 1.0668 км",
+            ("сажень", "метр (м)"): "💡 1 сажень ≈ 2.1336 м",
+            ("аршин", "метр (м)"): "💡 1 аршин ≈ 0.7112 м",
             ("дюйм (in)", "сантиметр (см)"): "💡 1 дюйм = 2.54 см",
             ("фут (ft)", "метр (м)"): "💡 1 фут = 0.3048 м",
             ("Фаренгейт (°F)", "Цельсий (°C)"): "💡 32°F = 0°C, 212°F = 100°C",
             ("байт (byte)", "бит (bit)"): "💡 1 байт = 8 бит",
-            ("мегабит/сек (Mbps)", "мегабайт/сек (MBps)"): "💡 100 Мбит/с = 12.5 МБ/с"
+            ("мегабит/сек (Mbps)", "мегабайт/сек (MBps)"): "💡 100 Мбит/с ≈ 12.5 МБ/с",
         }
         
         for (from_u, to_u), hint in hints.items():
@@ -887,70 +1404,173 @@ class BotHandlers:
                 return hint
         
         return "💡 Введите значение для конвертации"
+    
+    def _format_conversion_response(self, conversion: ConversionResult, value_str: str, result_str: str) -> str:
+        """Форматирование ответа с результатом конвертации"""
+        # Определяем эмодзи для категории
+        category_emojis = {
+            "Длина": "📏", "Масса": "⚖️", "Время": "⏰", "Температура": "🌡️",
+            "Площадь": "📐", "Объем": "🧪", "Скорость": "🚀", "Давление": "📊",
+            "Энергия": "⚡", "Мощность": "💪", "Информация": "💻"
+        }
+        
+        emoji = category_emojis.get(conversion.category, "🔢")
+        
+        response = (
+            f"{emoji} *Результат конвертации*\n\n"
+            f"*Исходное значение:* `{value_str} {conversion.unit_from}`\n"
+            f"*Результат:* `{result_str} {conversion.unit_to}`\n"
+            f"*Категория:* {conversion.category}\n\n"
+            f"🕒 {conversion.timestamp.strftime('%H:%M:%S')}"
+        )
+        
+        return response
+    
+    async def handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Обработка текстовых сообщений для навигации"""
+        text = update.message.text
+        self.update_user_activity(update.effective_user.id)
+        
+        navigation_handlers = {
+            "🔄 Конвертировать": self.show_categories,
+            "⭐ Избранное": self.show_favorites_menu,
+            "🚀 Быстрые конвертации": self.show_quick_conversions,
+            "📊 История и статистика": self.show_history_and_stats,
+            "📈 Последние конвертации": self.show_recent_conversions,
+            "📊 Статистика": self.show_user_stats,
+            "📋 Список избранного": self.show_favorites_list,
+            "⚙️ Настройки": self.show_settings,
+            "ℹ️ Справка": self.help_command
+        }
+        
+        if text in navigation_handlers:
+            await navigation_handlers[text](update, context)
+        elif text.startswith("⭐ "):
+            await self.handle_favorite_selection(update, context)
+        else:
+            await update.message.reply_text(
+                "🤖 Используйте кнопки ниже для навигации или команду /help для справки",
+                reply_markup=self.keyboard.create_main_menu()
+            )
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик ошибок"""
+    """Глобальный обработчик ошибок"""
     logger.error(f"Ошибка: {context.error}", exc_info=context.error)
     
-    if update and update.message:
-        await update.message.reply_text(
-            "❌ Произошла непредвиденная ошибка. Пожалуйста, попробуйте снова.",
-            reply_markup=KeyboardManager().create_main_keyboard()
+    if update and update.effective_message:
+        error_text = (
+            "❌ *Произошла непредвиденная ошибка*\n\n"
+            "Пожалуйста, попробуйте снова или используйте команду /start для перезагрузки бота."
         )
+        
+        try:
+            await update.effective_message.reply_text(
+                error_text,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InteractiveKeyboardManager().create_main_menu()
+            )
+        except Exception as e:
+            logger.error(f"Не удалось отправить сообщение об ошибке: {e}")
+
+async def cleanup_task(context: ContextTypes.DEFAULT_TYPE):
+    """Задача для очистки устаревших данных"""
+    try:
+        db = AdvancedDatabaseManager()
+        db.cleanup_old_history(30)  # Очищаем историю старше 30 дней
+        logger.info("✅ Очистка устаревшей истории выполнена")
+    except Exception as e:
+        logger.error(f"Ошибка при очистке истории: {e}")
 
 async def post_init(application: Application) -> None:
     """Функция, выполняемая после инициализации бота"""
-    logger.info("🤖 Бот успешно инициализирован и готов к работе!")
-    logger.info(f"📊 Загружено {len(PHYSICAL_QUANTITIES)} категорий с {sum(len(units) for units in PHYSICAL_QUANTITIES.values())} единицами измерения")
+    logger.info("🤖 Продвинутый бот-конвертер успешно запущен!")
+    
+    # Запускаем периодические задачи
+    job_queue = application.job_queue
+    if job_queue:
+        job_queue.run_repeating(cleanup_task, interval=86400, first=10)  # Ежедневно
+    
+    # Статистика при запуске
+    total_categories = len(EnhancedUnitConverter.PHYSICAL_QUANTITIES)
+    total_units = sum(len(units) for units in EnhancedUnitConverter.PHYSICAL_QUANTITIES.values())
+    logger.info(f"📊 Загружено {total_categories} категорий с {total_units} единицами измерения")
 
 def main() -> None:
-    """Запуск бота"""
-    # Инициализация базы данных
-    init_database()
-    
+    """Запуск усовершенствованного бота"""
     # Создаем приложение
     application = Application.builder().token(TOKEN).post_init(post_init).build()
     
     # Инициализируем обработчики
-    handlers = BotHandlers()
+    handlers = AdvancedBotHandlers()
     
-    # Обработчики команд
+    # Добавляем обработчики команд
     application.add_handler(CommandHandler("start", handlers.start))
     application.add_handler(CommandHandler("help", handlers.help_command))
-    application.add_handler(CommandHandler("categories", handlers.show_categories))
-    application.add_handler(CommandHandler("favorites", handlers.show_favorites))
-    application.add_handler(CommandHandler("history", handlers.show_history))
-    application.add_handler(CommandHandler("stats", handlers.show_stats))
+    application.add_handler(CommandHandler("favorites", handlers.show_favorites_menu))
+    application.add_handler(CommandHandler("history", handlers.show_history_and_stats))
+    application.add_handler(CommandHandler("stats", handlers.show_user_stats))
+    application.add_handler(CommandHandler("settings", handlers.show_settings))
     
-    # ConversationHandler для конвертации
+    # ConversationHandler для процесса конвертации
     conv_handler = ConversationHandler(
         entry_points=[
-            CommandHandler("convert", handlers.convert_start),
-            MessageHandler(filters.Text(["📊 Конвертировать"]), handlers.convert_start)
+            CommandHandler("convert", handlers.show_categories),
+            MessageHandler(filters.Text(["🔄 Конвертировать"]), handlers.show_categories)
         ],
         states={
-            SELECT_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.select_category)],
-            SELECT_UNIT_FROM: [MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.select_unit_from)],
-            SELECT_UNIT_TO: [MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.select_unit_to)],
-            ENTER_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.enter_value)],
-            SAVE_FAVORITE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.save_favorite_handler)],
+            BotState.SELECT_CATEGORY.value: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.handle_category_selection)
+            ],
+            BotState.SELECT_UNIT_FROM.value: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.handle_unit_from_selection)
+            ],
+            BotState.SELECT_UNIT_TO.value: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.handle_unit_to_selection)
+            ],
+            BotState.ENTER_VALUE.value: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.handle_value_input)
+            ],
+            BotState.SAVE_FAVORITE.value: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.handle_after_conversion)
+            ],
         },
         fallbacks=[CommandHandler("cancel", handlers.start)],
     )
     
     application.add_handler(conv_handler)
     
-    # Обработчики для быстрых конвертаций
+    # Обработчики быстрых конвертаций
     application.add_handler(MessageHandler(
         filters.Text(["🚀 Быстрые конвертации"]), 
-        handlers.show_popular_conversions
-    ))
-    application.add_handler(MessageHandler(
-        filters.Text([name for name in POPULAR_CONVERSIONS.keys()]), 
-        handlers.handle_popular_conversion
+        handlers.show_quick_conversions
     ))
     
-    # Обработчик текстовых сообщений (для кнопок)
+    quick_conversion_types = [
+        "📏 Дюймы → см", "⚖️ Фунты → кг", "🌡️ °F → °C",
+        "💻 Мбит → МБ/с", "🛣️ Мили → км", "📐 Футы → метры"
+    ]
+    application.add_handler(MessageHandler(
+        filters.Text(quick_conversion_types), 
+        handlers.handle_quick_conversion
+    ))
+    
+    # Обработчики истории и статистики
+    application.add_handler(MessageHandler(
+        filters.Text(["📈 Последние конвертации"]), 
+        handlers.show_recent_conversions
+    ))
+    application.add_handler(MessageHandler(
+        filters.Text(["📊 Статистика"]), 
+        handlers.show_user_stats
+    ))
+    
+    # Обработчики избранного
+    application.add_handler(MessageHandler(
+        filters.Text(["📋 Список избранного"]), 
+        handlers.show_favorites_list
+    ))
+    
+    # Основной обработчик текстовых сообщений (навигация)
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND, 
         handlers.handle_text_message
@@ -960,8 +1580,10 @@ def main() -> None:
     application.add_error_handler(error_handler)
     
     # Запуск бота
-    logger.info("🚀 Запускаю бота...")
+    logger.info("🚀 Запускаю продвинутого бота-конвертера...")
     application.run_polling()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
+
+
