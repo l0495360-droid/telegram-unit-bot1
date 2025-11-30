@@ -71,7 +71,7 @@ class ConversionResult:
     timestamp: datetime
 
 class EnhancedUnitConverter:
-    """Усовершенствованный конвертер с поддержкой формул и сложных преобразований"""
+    """Усовершенствованный конвертер с поддержкой древнерусских мер"""
     
     # Расширенная база единиц измерения
     PHYSICAL_QUANTITIES = {
@@ -295,6 +295,37 @@ class EnhancedUnitConverter:
     }
 
     @classmethod
+    def get_compatible_categories(cls, category: str) -> List[str]:
+        """Получить список совместимых категорий"""
+        compatible = {
+            "Длина": ["Длина", "Древнерусские меры длины"],
+            "Древнерусские меры длины": ["Длина", "Древнерусские меры длины"],
+        }
+        
+        # По умолчанию категория совместима только сама с собой
+        return compatible.get(category, [category])
+
+    @classmethod
+    def get_compatible_units(cls, category: str) -> Dict[str, Any]:
+        """Получить все совместимые единицы измерения"""
+        compatible_categories = cls.get_compatible_categories(category)
+        result = {}
+        
+        for cat in compatible_categories:
+            if cat in cls.PHYSICAL_QUANTITIES:
+                result.update(cls.PHYSICAL_QUANTITIES[cat])
+        
+        return result
+
+    @classmethod
+    def find_unit_category(cls, unit_name: str) -> Optional[str]:
+        """Найти категорию для единицы измерения"""
+        for category, units in cls.PHYSICAL_QUANTITIES.items():
+            if unit_name in units:
+                return category
+        return None
+
+    @classmethod
     def convert_temperature(cls, value: float, from_unit: str, to_unit: str) -> float:
         """Конвертация температуры с поддержкой всех шкал"""
         if from_unit == to_unit:
@@ -335,17 +366,15 @@ class EnhancedUnitConverter:
 
     @classmethod
     def convert_standard(cls, value: float, from_unit: str, to_unit: str, category: str) -> float:
-        """Конвертация стандартных величин"""
-        if category not in cls.PHYSICAL_QUANTITIES:
-            raise ValueError(f"Неизвестная категория: {category}")
+        """Конвертация стандартных величин с поддержкой древнерусских мер"""
+        # Получаем ВСЕ совместимые единицы для категории
+        compatible_units = cls.get_compatible_units(category)
         
-        units_dict = cls.PHYSICAL_QUANTITIES[category]
+        if from_unit not in compatible_units or to_unit not in compatible_units:
+            raise ValueError(f"Неизвестные единицы измерения: {from_unit} -> {to_unit}")
         
-        if from_unit not in units_dict or to_unit not in units_dict:
-            raise ValueError(f"Неизвестные единицы измерения")
-        
-        from_data = units_dict[from_unit]
-        to_data = units_dict[to_unit]
+        from_data = compatible_units[from_unit]
+        to_data = compatible_units[to_unit]
         
         # Для температур используем специальный метод
         if from_data.get("type") == "temperature" or to_data.get("type") == "temperature":
@@ -358,27 +387,20 @@ class EnhancedUnitConverter:
         return value * from_factor / to_factor
 
     @classmethod
-    def get_compatible_categories(cls, category: str) -> List[str]:
-        """Получить список совместимых категорий"""
-        compatible = {
-            "Длина": ["Длина", "Древнерусские меры длины"],
-            "Древнерусские меры длины": ["Длина", "Древнерусские меры длины"],
-        }
+    def universal_convert(cls, value: float, from_unit: str, to_unit: str) -> float:
+        """Универсальная конвертация между любыми единицами длины"""
+        from_category = cls.find_unit_category(from_unit)
+        to_category = cls.find_unit_category(to_unit)
         
-        # По умолчанию категория совместима только сама с собой
-        return compatible.get(category, [category])
-
-    @classmethod
-    def get_compatible_units(cls, category: str) -> Dict[str, Any]:
-        """Получить все совместимые единицы измерения"""
-        compatible_categories = cls.get_compatible_categories(category)
-        result = {}
+        if not from_category or not to_category:
+            raise ValueError("Неизвестные единицы измерения")
         
-        for cat in compatible_categories:
-            if cat in cls.PHYSICAL_QUANTITIES:
-                result.update(cls.PHYSICAL_QUANTITIES[cat])
+        # Если единицы из совместимых категорий
+        compatible_categories = cls.get_compatible_categories(from_category)
+        if to_category not in compatible_categories:
+            raise ValueError(f"Единицы {from_unit} и {to_unit} несовместимы")
         
-        return result
+        return cls.convert_standard(value, from_unit, to_unit, from_category)
 
     @staticmethod
     def format_result(value: float, precision: int = 8) -> str:
@@ -751,6 +773,7 @@ class AdvancedBotHandlers:
 • 📊 Подробная статистика и аналитика
 • 🚀 Быстрые популярные конвертации
 • 🎯 Поддержка математических выражений
+• 🏰 Конвертация в древнерусские меры
 
 📋 *Быстрый старт:*
 1. Нажмите `🔄 Конвертировать`
@@ -784,6 +807,11 @@ class AdvancedBotHandlers:
 1. Выберите категорию измерения
 2. Выберите исходную и целевую единицы
 3. Введите значение для конвертации
+
+*🏰 Древнерусские меры:*
+• Можно конвертировать между современными и древнерусскими единицами
+• Выберите категорию "Длина" или "Древнерусские меры длины"
+• Доступны: вершок, пядь, локоть, аршин, сажень, верста, поприще
 
 *🔢 Поддерживаемые форматы ввода:*
 • Целые числа: `10`, `-5`, `1000`
@@ -851,6 +879,7 @@ class AdvancedBotHandlers:
         session = self.get_user_session(user_id)
         session['current_category'] = category
         
+        # Получаем единицы измерения ТОЛЬКО из выбранной категории
         units = list(self.converter.PHYSICAL_QUANTITIES[category].keys())
         
         await update.message.reply_text(
@@ -876,6 +905,7 @@ class AdvancedBotHandlers:
         session = self.get_user_session(user_id)
         category = session.get('current_category')
         
+        # Проверяем, что единица принадлежит выбранной категории
         if not category or unit_from not in self.converter.PHYSICAL_QUANTITIES.get(category, {}):
             await update.message.reply_text(
                 "❌ Пожалуйста, выберите единицу измерения из предложенных вариантов.",
@@ -885,7 +915,7 @@ class AdvancedBotHandlers:
         
         session['unit_from'] = unit_from
         
-        # Получаем совместимые единицы
+        # Получаем ВСЕ совместимые единицы для выбранной категории
         compatible_units = self.converter.get_compatible_units(category)
         available_units = [unit for unit in compatible_units.keys() if unit != unit_from]
         
@@ -924,7 +954,7 @@ class AdvancedBotHandlers:
             )
             return ConversationHandler.END
         
-        # Проверяем совместимость единиц
+        # Проверяем совместимость единиц через совместимые категории
         compatible_units = self.converter.get_compatible_units(category)
         if unit_to not in compatible_units:
             await update.message.reply_text(
@@ -1000,11 +1030,8 @@ class AdvancedBotHandlers:
             return ConversationHandler.END
         
         try:
-            # Выполняем конвертацию
-            if category == "Температура":
-                result = self.converter.convert_temperature(value, unit_from, unit_to)
-            else:
-                result = self.converter.convert_standard(value, unit_from, unit_to, category)
+            # Выполняем конвертацию с использованием совместимых единиц
+            result = self.converter.convert_standard(value, unit_from, unit_to, category)
             
             # Проверка на специальные значения
             if math.isinf(result) or math.isnan(result):
@@ -1035,7 +1062,7 @@ class AdvancedBotHandlers:
             session['conversion_count'] += 1
             session['last_conversion'] = conversion_result
             
-            # Формируем красивый ответ БЕЗ ВРЕМЕНИ
+            # Формируем красивый ответ
             response = self._format_conversion_response(conversion_result, value_str, result_str)
             
             await update.message.reply_text(
@@ -1211,7 +1238,6 @@ class AdvancedBotHandlers:
         
         history_text = "📈 *Последние конвертации:*\n\n"
         for i, conv in enumerate(conversions, 1):
-            # УБИРАЕМ ВРЕМЯ - показываем только номер конвертации
             from_val = self.converter.format_result(conv['from_value'])
             to_val = self.converter.format_result(conv['to_value'])
             history_text += f"*{i}.* `{from_val} {conv['from_unit']} → {to_val} {conv['to_unit']}`\n\n"
@@ -1342,9 +1368,13 @@ class AdvancedBotHandlers:
     def _get_conversion_hint(self, from_unit: str, to_unit: str) -> str:
         """Получить подсказку для конвертации"""
         hints = {
+            ("парсек (pc)", "локоть"): "💡 1 парсек ≈ 6.75e16 локтей",
             ("верста", "километр (км)"): "💡 1 верста ≈ 1.0668 км",
             ("сажень", "метр (м)"): "💡 1 сажень ≈ 2.1336 м",
             ("аршин", "метр (м)"): "💡 1 аршин ≈ 0.7112 м",
+            ("локоть", "метр (м)"): "💡 1 локоть ≈ 0.4572 м",
+            ("пядь", "сантиметр (см)"): "💡 1 пядь ≈ 17.78 см",
+            ("вершок", "сантиметр (см)"): "💡 1 вершок ≈ 4.445 см",
             ("дюйм (in)", "сантиметр (см)"): "💡 1 дюйм = 2.54 см",
             ("фут (ft)", "метр (м)"): "💡 1 фут = 0.3048 м",
             ("Фаренгейт (°F)", "Цельсий (°C)"): "💡 32°F = 0°C, 212°F = 100°C",
@@ -1359,12 +1389,13 @@ class AdvancedBotHandlers:
         return "💡 Введите значение для конвертации"
     
     def _format_conversion_response(self, conversion: ConversionResult, value_str: str, result_str: str) -> str:
-        """Форматирование ответа с результатом конвертации БЕЗ ВРЕМЕНИ"""
+        """Форматирование ответа с результатом конвертации"""
         # Определяем эмодзи для категории
         category_emojis = {
             "Длина": "📏", "Масса": "⚖️", "Время": "⏰", "Температура": "🌡️",
             "Площадь": "📐", "Объем": "🧪", "Скорость": "🚀", "Давление": "📊",
-            "Энергия": "⚡", "Мощность": "💪", "Информация": "💻"
+            "Энергия": "⚡", "Мощность": "💪", "Информация": "💻",
+            "Древнерусские меры длины": "🏰"
         }
         
         emoji = category_emojis.get(conversion.category, "🔢")
