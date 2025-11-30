@@ -517,27 +517,6 @@ class AdvancedDatabaseManager:
                     first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
-            
-            conn.execute('''
-                CREATE TABLE IF NOT EXISTS user_settings (
-                    user_id INTEGER PRIMARY KEY,
-                    language TEXT DEFAULT 'ru',
-                    precision INTEGER DEFAULT 6,
-                    notation TEXT DEFAULT 'auto',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            
-            # Таблица для кэша курсов валют (если добавим в будущем)
-            conn.execute('''
-                CREATE TABLE IF NOT EXISTS exchange_rates (
-                    base_currency TEXT,
-                    target_currency TEXT,
-                    rate REAL,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (base_currency, target_currency)
-                )
-            ''')
     
     @contextmanager
     def get_db_connection(self):
@@ -668,11 +647,11 @@ class InteractiveKeyboardManager:
     
     @staticmethod
     def create_main_menu() -> ReplyKeyboardMarkup:
-        """Главное меню"""
+        """Главное меню БЕЗ НАСТРОЕК"""
         keyboard = [
             ["🔄 Конвертировать", "⭐ Избранное"],
             ["🚀 Быстрые конвертации", "📊 История и статистика"],
-            ["⚙️ Настройки", "ℹ️ Справка"]
+            ["ℹ️ Справка"]
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, input_field_placeholder="Выберите действие...")
     
@@ -708,16 +687,6 @@ class InteractiveKeyboardManager:
         keyboard = [
             ["📈 Последние конвертации", "📊 Статистика"],
             ["🏆 Частые конвертации", "🗑️ Очистить историю"],
-            ["🔙 Главное меню"]
-        ]
-        return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    
-    @staticmethod
-    def create_settings_menu() -> ReplyKeyboardMarkup:
-        """Меню настроек"""
-        keyboard = [
-            ["🎯 Точность вычислений", "🔤 Формат чисел"],
-            ["🗣️ Язык интерфейса", "📱 Тема оформления"],
             ["🔙 Главное меню"]
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -776,14 +745,12 @@ class AdvancedBotHandlers:
 
 🤖 *Умный конвертер физических величин* версии 2.0
 
-✨ *Новые возможности:*
+✨ *Основные возможности:*
 • 🔄 Конвертация 200+ единиц в 15+ категориях
 • ⭐ Умное избранное с быстрым доступом
 • 📊 Подробная статистика и аналитика
-• 🚀 Пакетная конвертация нескольких значений
+• 🚀 Быстрые популярные конвертации
 • 🎯 Поддержка математических выражений
-• 💾 Экспорт истории и избранного
-• ⚙️ Гибкие настройки отображения
 
 📋 *Быстрый старт:*
 1. Нажмите `🔄 Конвертировать`
@@ -811,7 +778,6 @@ class AdvancedBotHandlers:
 /favorites - Управление избранным
 /history - История конвертаций
 /stats - Подробная статистика
-/settings - Настройки бота
 /help - Эта справка
 
 *🔄 Процесс конвертации:*
@@ -837,7 +803,7 @@ class AdvancedBotHandlers:
 *💡 Советы:*
 • Используйте избранное для частых конвертаций
 • Просматривайте историю для повтора операций
-• Настройте точность вычислений под ваши нужды"""
+• Сохраняйте сложные конвертации в избранное"""
         
         await update.message.reply_text(
             help_text,
@@ -1069,7 +1035,7 @@ class AdvancedBotHandlers:
             session['conversion_count'] += 1
             session['last_conversion'] = conversion_result
             
-            # Формируем красивый ответ
+            # Формируем красивый ответ БЕЗ ВРЕМЕНИ
             response = self._format_conversion_response(conversion_result, value_str, result_str)
             
             await update.message.reply_text(
@@ -1245,11 +1211,10 @@ class AdvancedBotHandlers:
         
         history_text = "📈 *Последние конвертации:*\n\n"
         for i, conv in enumerate(conversions, 1):
-            date_str = datetime.strptime(conv['converted_at'], '%Y-%m-%d %H:%M:%S').strftime('%d.%m %H:%M')
+            # УБИРАЕМ ВРЕМЯ - показываем только номер конвертации
             from_val = self.converter.format_result(conv['from_value'])
             to_val = self.converter.format_result(conv['to_value'])
-            history_text += f"*{i}.* {date_str}\n"
-            history_text += f"   `{from_val} {conv['from_unit']} → {to_val} {conv['to_unit']}`\n\n"
+            history_text += f"*{i}.* `{from_val} {conv['from_unit']} → {to_val} {conv['to_unit']}`\n\n"
         
         await update.message.reply_text(
             history_text,
@@ -1273,19 +1238,17 @@ class AdvancedBotHandlers:
             return
         
         # Получаем дополнительные данные
-        recent_conversions = self.db.get_recent_conversions(user_id, 1)
         most_used = self.db.get_most_used_conversions(user_id, 3)
         
-        last_active = datetime.strptime(stats['last_activity'], '%Y-%m-%d %H:%M:%S')
-        first_seen = datetime.strptime(stats['first_seen'], '%Y-%m-%d %H:%M:%S')
-        days_active = (datetime.now() - first_seen).days
+        first_seen = datetime.strptime(stats['first_seen'], '%Y-%m-%d %H:%M:%S').strftime('%d.%m.%Y')
+        days_active = (datetime.now() - datetime.strptime(stats['first_seen'], '%Y-%m-%d %H:%M:%S')).days
         
         stats_text = (
             f"📊 *Ваша статистика*\n\n"
             f"• Всего конвертаций: *{stats['conversions_count']}*\n"
             f"• Избранных конвертаций: *{stats['favorites_count']}*\n"
             f"• Активность: *{days_active}* дней\n"
-            f"• Последняя активность: *{last_active.strftime('%d.%m.%Y %H:%M')}*\n\n"
+            f"• Первый вход: *{first_seen}*\n\n"
         )
         
         if most_used:
@@ -1376,15 +1339,6 @@ class AdvancedBotHandlers:
                 reply_markup=self.keyboard.create_favorites_menu()
             )
     
-    async def show_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Показать меню настроек"""
-        await update.message.reply_text(
-            "⚙️ *Настройки бота*\n\n"
-            "Настройте параметры отображения и поведения:",
-            reply_markup=self.keyboard.create_settings_menu(),
-            parse_mode=ParseMode.MARKDOWN
-        )
-    
     def _get_conversion_hint(self, from_unit: str, to_unit: str) -> str:
         """Получить подсказку для конвертации"""
         hints = {
@@ -1405,7 +1359,7 @@ class AdvancedBotHandlers:
         return "💡 Введите значение для конвертации"
     
     def _format_conversion_response(self, conversion: ConversionResult, value_str: str, result_str: str) -> str:
-        """Форматирование ответа с результатом конвертации"""
+        """Форматирование ответа с результатом конвертации БЕЗ ВРЕМЕНИ"""
         # Определяем эмодзи для категории
         category_emojis = {
             "Длина": "📏", "Масса": "⚖️", "Время": "⏰", "Температура": "🌡️",
@@ -1419,8 +1373,7 @@ class AdvancedBotHandlers:
             f"{emoji} *Результат конвертации*\n\n"
             f"*Исходное значение:* `{value_str} {conversion.unit_from}`\n"
             f"*Результат:* `{result_str} {conversion.unit_to}`\n"
-            f"*Категория:* {conversion.category}\n\n"
-            f"🕒 {conversion.timestamp.strftime('%H:%M:%S')}"
+            f"*Категория:* {conversion.category}"
         )
         
         return response
@@ -1438,7 +1391,6 @@ class AdvancedBotHandlers:
             "📈 Последние конвертации": self.show_recent_conversions,
             "📊 Статистика": self.show_user_stats,
             "📋 Список избранного": self.show_favorites_list,
-            "⚙️ Настройки": self.show_settings,
             "ℹ️ Справка": self.help_command
         }
         
@@ -1508,7 +1460,6 @@ def main() -> None:
     application.add_handler(CommandHandler("favorites", handlers.show_favorites_menu))
     application.add_handler(CommandHandler("history", handlers.show_history_and_stats))
     application.add_handler(CommandHandler("stats", handlers.show_user_stats))
-    application.add_handler(CommandHandler("settings", handlers.show_settings))
     
     # ConversationHandler для процесса конвертации
     conv_handler = ConversationHandler(
@@ -1584,6 +1535,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-
