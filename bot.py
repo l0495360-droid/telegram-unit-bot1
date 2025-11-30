@@ -9,7 +9,6 @@ from typing import Dict, List, Tuple, Optional, Any
 import sqlite3
 from contextlib import contextmanager
 from enum import Enum
-import aiohttp
 from dataclasses import dataclass
 
 from telegram import (
@@ -1585,5 +1584,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
 
